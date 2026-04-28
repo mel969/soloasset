@@ -149,6 +149,9 @@
     </div>
     <button class="tab active" data-view="dashboard">Dashboard</button>
     <button class="tab" data-view="assets">Assets</button>
+    <button class="tab" data-view="recip_mares">Recip Mares</button>
+    <button class="tab" data-view="trading">Horses</button>
+    <button class="tab" data-view="properties">Properties</button>
     <button class="tab" data-view="transfers">Transfers</button>
     <button class="tab" data-view="disposals">Disposals</button>
     <button class="tab" data-view="reports">Reports</button>
@@ -200,7 +203,18 @@
     return 1;
   }
   function schedule(a, throughYear) {
-    const cost=+a.cost||0, salvage=+a.salvage_value||0;
+    // Inventory held for resale is not depreciated (applies to Trading horses flagged as inventory).
+    // Land is never depreciated.
+    if (a && (a.is_inventory || a.is_land)) return [];
+    const rawCost=+a.cost||0;
+    const improvements=+a.improvements_cost||0;
+    const land=+a.land_value||0;
+    const priorAccum=+a.prior_accum_dep||0;
+    // Total depreciable cost (pre-§179/bonus/salvage):
+    //   total_value = cost + improvements - land
+    // Example: bought land+building for $500k (cost) + $50k renovation (improvements) with $100k land → $450k depreciable.
+    const cost=Math.max(rawCost+improvements-land,0);
+    const salvage=+a.salvage_value||0;
     const sec179=Math.min(+a.section_179||0, Math.max(cost-salvage,0));
     const bonusPct=Math.max(0,Math.min(100,+a.bonus_pct||0));
     const method=a.method, life=Math.max(0.5,+a.life_years||0), conv=a.convention;
@@ -212,56 +226,19 @@
     const bonusAmt=r2(postSec*(bonusPct/100));
     const depBasis=Math.max(postSec-bonusAmt-salvage,0);
     const dbRate=method==="ddb"?2/life:method==="db150"?1.5/life:method==="bonus"?2/life:0;
-
-    // Prior depreciation: asset was depreciated in another system through
-    // prior_through_date with a known accumulated amount. We skip booking
-    // for any year on/before that date, then resume from the carryover.
-    const priorDep = Math.max(0, +a.prior_depreciation || 0);
-    const priorThruDate = a.prior_through_date ? new Date(a.prior_through_date) : null;
-    const priorThruYear = priorThruDate ? yearOf(priorThruDate) : null;
-    const hasPrior = priorDep > 0 && priorThruYear != null;
-
-    const rows=[]; let nbv=cost, remaining=depBasis, accum=0;
-
-    if (hasPrior) {
-      // Prior dep is assumed to have already absorbed §179 + bonus + some
-      // regular depreciation. Whatever is left to book is depBasis minus the
-      // portion of prior dep that exceeded §179+bonus (clamped at 0).
-      accum = priorDep;
-      nbv = Math.max(cost - priorDep, 0);
-      const eatenAgainstBasis = Math.max(priorDep - sec179 - bonusAmt, 0);
-      remaining = Math.max(depBasis - eatenAgainstBasis, 0);
-    }
-
+    // Seed accumulated with any prior-accum-dep carried over from before this asset entered the tracker.
+    // NBV starts at cost - priorAccum so subsequent math stays consistent.
+    const rows=[]; let nbv=Math.max(cost-priorAccum,0), remaining=Math.max(depBasis-priorAccum,0), accum=r2(priorAccum);
     const maxYears=Math.ceil(life)+3;
     for (let k=0; k<maxYears; k++) {
       const y=inYear+k;
       if (throughYear!=null && y>throughYear) break;
       if (disposed && y>dispYear) break;
-
-      // Skip years entirely covered by prior-system depreciation.
-      if (hasPrior && y < priorThruYear) continue;
-
       const isFirst=k===0, isDisp=disposed && y===dispYear;
       const used=isFirst?0:firstFrac+(k-1);
       const remLife=Math.max(life-used,0.0001);
-
-      // Carryover row: surface the prior accum at the boundary year, no
-      // current-year expense (it was already booked elsewhere).
-      if (hasPrior && y === priorThruYear) {
-        rows.push({year:y,opening_nbv:r2(cost),sec179:0,bonus:0,
-          depreciation:0,total_expense:0,accumulated:r2(priorDep),
-          closing_nbv:r2(nbv),
-          notes:"Prior dep carryover thru "+a.prior_through_date});
-        if (isDisp) break;
-        continue;
-      }
-
       let s179=0,bon=0,dep=0; const openingNbv=nbv; const notes=[];
-
-      // §179 + bonus only apply on the in-service year, and only if there
-      // wasn't prior depreciation (priorDep already includes them).
-      if (isFirst && !hasPrior) {
+      if (isFirst) {
         s179=sec179; bon=bonusAmt;
         nbv-=(s179+bon); accum+=(s179+bon);
         if (s179>0) notes.push("§179 $"+s179.toLocaleString());
@@ -272,13 +249,13 @@
         if (method==="sl") fy=depBasis/life;
         else { const db=remaining*dbRate, sl=remaining/remLife; fy=Math.max(db,sl); }
         let frac=1;
-        if (isFirst && !hasPrior) frac=firstFrac;
+        if (isFirst) frac=firstFrac;
         if (isDisp)  frac=disposalYearFraction(conv,dispDate);
-        if (isFirst && isDisp && !hasPrior) frac=Math.min(firstFrac,disposalYearFraction(conv,dispDate));
+        if (isFirst && isDisp) frac=Math.min(firstFrac,disposalYearFraction(conv,dispDate));
         dep=Math.min(fy*frac,remaining); dep=r2(dep);
         remaining-=dep; nbv-=dep; accum+=dep;
       }
-      if (bonusPct>=100 && isFirst && !hasPrior && remaining<0.005) notes.push("Fully expensed year 1");
+      if (bonusPct>=100 && isFirst && remaining<0.005) notes.push("Fully expensed year 1");
       rows.push({year:y,opening_nbv:r2(openingNbv),sec179:r2(s179),bonus:r2(bon),
         depreciation:r2(dep),total_expense:r2(s179+bon+dep),accumulated:r2(accum),
         closing_nbv:r2(nbv),notes:notes.join("; ")});
@@ -291,10 +268,12 @@
     let cost=0,dep=0,acc=0,nbv=0,count=0;
     assets.forEach(a=>{
       const rs=schedule(a,y); const r=rs.find(x=>x.year===y);
-      cost+=+a.cost||0; count++;
+      // "Cost" for display = total asset value (cost + improvements), land stays included on balance sheet.
+      const totalValue = (+a.cost||0) + (+a.improvements_cost||0);
+      cost+=totalValue; count++;
       if (r) { dep+=r.total_expense; acc+=r.accumulated; nbv+=r.closing_nbv; }
-      else if (yearOf(a.in_service_date)>y) { nbv+=+a.cost||0; }
-      else { acc+=+a.cost||0; }
+      else if (yearOf(a.in_service_date)>y) { nbv+=totalValue; }
+      else { acc+=+a.prior_accum_dep||0; nbv+=totalValue-(+a.prior_accum_dep||0); }
     });
     return {cost:r2(cost),depreciation:r2(dep),accumulated:r2(acc),nbv:r2(nbv),count};
   }
@@ -311,29 +290,8 @@
 let sb = null;                 // supabase client
 let USER = null;               // { email, role, id }
 let STATE = {
-  entities: [], categories: [], assets: [], transfers: [], disposals: [], allowed: [],
-  // taxColsReady becomes true once the migration.sql §6 block has been run
-  // (adds property_type / prior_depreciation / prior_through_date). While
-  // false, the new tax-form UI fields are hidden and stripped from saves so
-  // the app keeps working without the migration.
-  taxColsReady: true
+  entities: [], categories: [], assets: [], transfers: [], disposals: [], allowed: []
 };
-
-const MIGRATION_SQL = [
-  "alter table categories",
-  "  add column if not exists property_type text default '1245'",
-  "  check (property_type in ('1245','1250','none'));",
-  "",
-  "alter table assets",
-  "  add column if not exists property_type text",
-  "  check (property_type in ('1245','1250','none'));",
-  "",
-  "alter table assets",
-  "  add column if not exists prior_depreciation numeric(14,2) default 0;",
-  "",
-  "alter table assets",
-  "  add column if not exists prior_through_date date;"
-].join("\n");
 
 // ------- helpers -------
 const $ = sel => document.querySelector(sel);
@@ -352,7 +310,25 @@ const el = (tag, attrs={}, ...kids) => {
   return n;
 };
 const fmt$ = n => "$" + (Math.round((+n||0)*100)/100).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+const r2 = n => Math.round((+n || 0) * 100) / 100;
 const fmtDate = s => s ? new Date(s).toLocaleDateString() : "";
+
+// Money-formatted text input. Shows "$xxx,xxx.xx" on blur; lets user type freely.
+// Usage: moneyInput({ value: current, onChange: v => obj.key = v })
+function moneyInput({value, onChange, placeholder="$0.00"}) {
+  const inp = el("input",{type:"text",inputmode:"decimal",placeholder:placeholder,style:"text-align:right"});
+  const format = n => (n==null||n==="") ? "" : "$" + (Math.round((+n||0)*100)/100).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+  const parse = s => {
+    if (s == null) return 0;
+    const cleaned = String(s).replace(/[^0-9.\-]/g,"");
+    return cleaned === "" ? 0 : (+cleaned || 0);
+  };
+  inp.value = format(value);
+  inp.addEventListener("input", () => { if (onChange) onChange(parse(inp.value)); });
+  inp.addEventListener("blur",  () => { inp.value = format(parse(inp.value)); });
+  inp.addEventListener("focus", () => { inp.value = String(parse(inp.value) || ""); if (parse(inp.value)===0) inp.value=""; inp.select(); });
+  return inp;
+}
 const todayISO = () => new Date().toISOString().slice(0,10);
 const thisYear = () => new Date().getFullYear();
 const byId = (arr,id) => arr.find(x=>x.id===id) || null;
@@ -363,42 +339,60 @@ const flash = (msg, type="ok") => {
 };
 const METHOD_LABELS = { bonus:"Bonus + DDB", ddb:"200% DDB", db150:"150% DB", sl:"Straight Line" };
 const CONV_LABELS   = { half_year:"Half-Year", mid_quarter:"Mid-Quarter", mid_month:"Mid-Month" };
-const PROP_TYPE_LABELS = { "1245":"§1245 (personal property)", "1250":"§1250 (real property)", "none":"None / non-recapture" };
 
-// Resolve effective property type: per-asset override wins, else category default,
-// else heuristic (real property if life ≥ 27 years), else §1245.
-function effectivePropertyType(a) {
-  if (a && a.property_type) return a.property_type;
-  const c = a && a.category_id ? byId(STATE.categories, a.category_id) : null;
-  if (c && c.property_type) return c.property_type;
-  if ((+(a&&a.life_years)||0) >= 27) return "1250";
-  return "1245";
-}
-function effectivePropertyTypeLabel(a) {
-  return PROP_TYPE_LABELS[effectivePropertyType(a)] || effectivePropertyType(a);
-}
-
-// Banner shown at the top of Reports (and elsewhere) when the tax-form
-// migration block hasn't been run yet. Surfaces the SQL to copy-paste and a
-// re-check button. Reports themselves still work via heuristic fallback.
-function migrationBanner() {
-  const sql = el("textarea",{readonly:true,style:"width:100%;height:140px;font-family:ui-monospace,Menlo,monospace;font-size:11px;background:#fff;border:1px solid var(--border);border-radius:4px;padding:8px;margin-top:6px"}, MIGRATION_SQL);
-  const wrap = el("div",{class:"card",style:"border-left:4px solid var(--warn,#c98a2b);margin-bottom:14px"},
-    el("div",{class:"bd"},
-      el("h3",{style:"margin:0 0 4px"}, "Database migration pending — tax form features partially active"),
-      el("p",{class:"small",style:"margin:0 0 8px"},
-        "Form 4797 and Form 4562 reports work using sensible defaults (any asset with life ≥ 27 yrs is treated as §1250 real property; everything else as §1245). To enable the per-asset property-type override, prior-depreciation handling, and the property-type column on categories, run this in Supabase Studio → SQL Editor:"),
-      sql,
-      el("div",{style:"margin-top:8px;display:flex;gap:6px"},
-        el("button",{class:"btn",onclick:async()=>{
-          try { await navigator.clipboard.writeText(MIGRATION_SQL); flash("SQL copied — paste into Studio SQL Editor"); }
-          catch(_){ sql.select(); document.execCommand("copy"); flash("SQL copied"); }
-        }},"Copy SQL"),
-        el("button",{class:"btn ghost",onclick:async()=>{ await refreshAll(); show("reports"); flash(STATE.taxColsReady?"Migration detected — features enabled":"Still pending","warn"); }},"I just ran it — re-check")
-      )
-    )
-  );
-  return wrap;
+// ----- period-based depreciation helpers -----
+// Compute depreciation split by custom date window [startISO, endISO] for one asset.
+// Allocates each year's annual depreciation by day fraction within the year.
+// Returns { priorAccum, periodExpense, endAccum, endNBV, monthly: [{ymd,value}] }.
+function assetPeriodDep(a, startISO, endISO) {
+  const start = new Date(startISO + "T00:00:00Z");
+  const end   = new Date(endISO   + "T00:00:00Z");
+  const sched = Depreciation.schedule(a);
+  let priorAccum = 0, periodExpense = 0, endAccum = 0;
+  const monthly = {}; // key "YYYY-MM" -> $
+  const dayMs = 86400000;
+  const addDays = (d,n) => new Date(d.getTime() + n*dayMs);
+  const daysInYear = y => ((y%4===0 && y%100!==0) || y%400===0) ? 366 : 365;
+  const yearBounds = y => [ new Date(Date.UTC(y,0,1)), new Date(Date.UTC(y,11,31)) ];
+  for (const r of sched) {
+    const [yStart, yEnd] = yearBounds(r.year);
+    const dYear = daysInYear(r.year);
+    const annual = r.total_expense || 0;
+    // Prior-to-period portion of this year
+    if (r.year < start.getUTCFullYear()) {
+      priorAccum += annual;
+      endAccum   += annual;
+      continue;
+    }
+    if (r.year > end.getUTCFullYear()) break;
+    // Overlap of [yStart,yEnd] with [start,end]
+    const ovStart = yStart > start ? yStart : start;
+    const ovEnd   = yEnd   < end   ? yEnd   : end;
+    const ovDays  = ovEnd >= ovStart ? Math.floor((ovEnd - ovStart)/dayMs)+1 : 0;
+    // Pre-period portion of this year (from yStart to day-before-start)
+    const preEnd  = addDays(start, -1);
+    const preOv   = preEnd >= yStart ? Math.floor(((preEnd < yEnd ? preEnd : yEnd) - yStart)/dayMs)+1 : 0;
+    // Through-end-of-period portion of this year (yStart to min(end, yEnd))
+    const thruEnd = (end < yEnd ? end : yEnd);
+    const thruOv  = thruEnd >= yStart ? Math.floor((thruEnd - yStart)/dayMs)+1 : 0;
+    priorAccum   += annual * (preOv / dYear);
+    periodExpense += annual * (ovDays / dYear);
+    endAccum     += annual * (thruOv / dYear);
+    // Monthly bucket within overlap
+    let cursor = new Date(Date.UTC(r.year, 0, 1));
+    for (let m=0; m<12; m++) {
+      const mStart = new Date(Date.UTC(r.year, m, 1));
+      const mEnd   = new Date(Date.UTC(r.year, m+1, 0));
+      const msOv   = (mEnd < start || mStart > end) ? 0
+        : Math.floor(((mEnd<end?mEnd:end) - (mStart>start?mStart:start))/dayMs)+1;
+      if (msOv > 0) {
+        const key = r.year + "-" + String(m+1).padStart(2,"0");
+        monthly[key] = (monthly[key] || 0) + annual * (msOv / dYear);
+      }
+    }
+  }
+  const endNBV = (+a.cost||0) - endAccum;
+  return { priorAccum, periodExpense, endAccum, endNBV, monthly };
 }
 
 // ------- modal -------
@@ -494,13 +488,6 @@ async function refreshAll() {
     sb.from("disposals").select("*").order("disposal_date",{ascending:false}),
     sb.from("allowed_emails").select("*").order("email"),
   ]);
-  // Probe whether the tax-form columns from migration.sql §6 are present.
-  // We try selecting one of them; if Postgres errors with column-not-found
-  // (PGRST/42703), we hide the related UI and strip those keys on save.
-  try {
-    const probe = await sb.from("categories").select("property_type").limit(1);
-    STATE.taxColsReady = !probe.error;
-  } catch (_) { STATE.taxColsReady = false; }
   STATE.entities = ent.data || [];
   STATE.categories = cat.data || [];
   STATE.assets = as.data || [];
@@ -545,14 +532,27 @@ async function remove(table, id) {
 
 // ------- routing -------
 const VIEWS = {};
+let _currentView = { name: "dashboard", ctx: {} };
 function show(name, ctx) {
-  // "asset" / "entity" are synthetic detail views — keep their list tab active.
-  const tabKey = (name === "asset") ? "assets"
-               : (name === "entity") ? "entities"
-               : name;
+  // "asset" is a synthetic detail view — keep "assets" tab active for it.
+  const tabKey = (name === "asset") ? "assets" : name;
   $$("nav.side .tab").forEach(b => b.classList.toggle("active", b.dataset.view===tabKey));
   const v = $("#view");
   v.innerHTML = "";
+  _currentView = { name, ctx: ctx||{} };
+  // Top-bar: reload button appears on every page
+  const bar = el("div",{style:"display:flex;justify-content:flex-end;align-items:center;margin:0 0 8px 0;gap:8px"},
+    el("button",{class:"btn ghost sm", id:"reloadBtn",
+      title:"Reload data from server",
+      onclick: async () => {
+        const btn = document.getElementById("reloadBtn");
+        if (btn) { btn.disabled = true; btn.textContent = "Reloading…"; }
+        try { await refreshAll(); show(_currentView.name, _currentView.ctx); flash("Reloaded"); }
+        catch(e) { flash("Reload failed: "+(e&&e.message||e),"err"); }
+      }
+    }, "↻ Reload")
+  );
+  v.appendChild(bar);
   (VIEWS[name] || VIEWS.dashboard)(v, ctx||{});
 }
 $$("nav.side .tab").forEach(b => b.addEventListener("click", () => show(b.dataset.view)));
@@ -600,7 +600,7 @@ VIEWS.dashboard = function(root) {
   const entLink = (name) => {
     const en = STATE.entities.find(x=>x.name===name);
     const a = el("a",{href:"#",style:"color:var(--maroon);text-decoration:none;font-weight:600;cursor:pointer"},name);
-    a.onclick = (e) => { e.preventDefault(); if (en) show("entity",{id:en.id}); else show("assets",{entity_id:"__none__", status:"active"}); };
+    a.onclick = (e) => { e.preventDefault(); show("assets",{entity_id: en?en.id:"__none__", status:"active"}); };
     return a;
   };
   root.appendChild(card("By category",
@@ -709,41 +709,130 @@ VIEWS.assets = function(root, ctx) {
     const list = filtered();
     tblBd.innerHTML = "";
     const y = thisYear();
-    const rows = list.map(a => {
+
+    // Partition: property sub-assets get grouped under parent folder rows.
+    const propGroups = {}; // pname -> [assets]
+    const regular = [];
+    list.forEach(a => {
+      if (a.pool_type === "property" && a.property_group) {
+        (propGroups[a.property_group] = propGroups[a.property_group] || []).push(a);
+      } else {
+        regular.push(a);
+      }
+    });
+
+    const tbl = el("table",{class:"tbl",style:"width:100%;table-layout:auto"});
+    const thead = el("thead",{}, el("tr",{},
+      [
+        {label:"",style:"width:28px"},
+        {label:"Description"},
+        {label:"Category",style:"width:160px"},
+        {label:"Entity",style:"width:160px"},
+        {label:"In service",style:"width:100px"},
+        {label:"Cost",style:"text-align:right;width:110px"},
+        {label:"Dep "+y,style:"text-align:right;width:100px"},
+        {label:"NBV "+y+" end",style:"text-align:right;width:110px"},
+        {label:"Status",style:"width:80px"},
+        {label:"Actions",style:"width:1%;white-space:nowrap;text-align:right"}
+      ].map(h => el("th",{style:h.style||""}, h.label))
+    ));
+    tbl.appendChild(thead);
+    const tbody = el("tbody",{});
+    tbl.appendChild(tbody);
+
+    function subAssetRow(a, opts) {
+      opts = opts||{};
+      const indent = !!opts.indent;
+      const propName = opts.propertyName || "";
       const c = byId(STATE.categories, a.category_id);
       const e = byId(STATE.entities, a.entity_id);
       const s = Depreciation.schedule(a, y).find(r=>r.year===y);
       const dep = s ? s.total_expense : 0;
       const nbv = s ? s.closing_nbv : (new Date(a.in_service_date).getFullYear()>y ? (+a.cost||0) : 0);
-      const titleLink = el("a",{href:"#",style:"color:var(--maroon);text-decoration:none;cursor:pointer"},
-        el("b",{},a.description)
-      );
-      titleLink.onclick = (ev) => { ev.preventDefault(); show("asset",{id:a.id}); };
-      return [
-        el("div",{},
-          titleLink,
-          el("div",{class:"small"}, [a.asset_number, a.make, a.model, a.year].filter(Boolean).join(" · "))
-        ),
-        c ? el("span",{class:"chip",style:c.color?("background:"+c.color+"22; color:"+c.color):""}, c.name) : el("span",{class:"chip dim"},"—"),
-        e ? e.name : "—",
-        fmtDate(a.in_service_date),
-        {class:"num", value:fmt$(a.cost)},
-        {class:"num", value:fmt$(dep)},
-        {class:"num", value:fmt$(nbv)},
-        el("span",{class:"chip "+(a.status==="active"?"ok":a.status==="disposed"?"err":"warn")}, a.status),
-        el("div",{},
-          el("button",{class:"btn ghost sm",onclick:()=>openAssetModal(a.id)},"Edit"),
-          el("button",{class:"btn ghost sm",onclick:()=>openScheduleModal(a.id)},"Schedule"),
-          a.status==="active" && el("button",{class:"btn ghost sm",onclick:()=>openTransferModal(a.id)},"Transfer"),
-          a.status==="active" && el("button",{class:"btn ghost sm",onclick:()=>openDisposalModal(a.id)},"Dispose"),
-        )
-      ];
+      // For indented sub-rows inside a property folder, strip the "PropertyName - " prefix.
+      let displayDesc = a.description || "";
+      if (indent && propName && displayDesc.toLowerCase().startsWith(propName.toLowerCase() + " - ")) {
+        displayDesc = displayDesc.slice(propName.length + 3);
+      }
+      const titleLink = el("a",{href:"#",style:"color:var(--maroon);text-decoration:none;cursor:pointer;font-weight:500"}, displayDesc);
+      titleLink.onclick = ev => { ev.preventDefault(); show("asset",{id:a.id}); };
+      const tr = el("tr",{});
+      tr.appendChild(el("td",{},"")); // caret column
+      // Description cell: for indented rows, thin maroon left border + subtle indent. No gold.
+      const descCell = el("td",{style: indent ? "padding-left:36px;position:relative" : ""}, titleLink);
+      if (indent) {
+        // Subtle left guide line
+        descCell.appendChild(el("span",{style:"position:absolute;left:12px;top:0;bottom:0;width:1px;background:var(--border)"}));
+      }
+      if (!indent) {
+        const meta = [a.asset_number, a.make, a.model, a.year].filter(Boolean).join(" · ");
+        if (meta) descCell.appendChild(el("div",{class:"small"}, meta));
+      }
+      tr.appendChild(descCell);
+      tr.appendChild(el("td",{}, c ? el("span",{class:"chip",style:c.color?("background:"+c.color+"18; color:"+c.color+";border:1px solid "+c.color+"33"):""}, c.name) : el("span",{class:"chip dim"},"—")));
+      tr.appendChild(el("td",{style:"white-space:nowrap"}, e?e.name:"—"));
+      tr.appendChild(el("td",{style:"white-space:nowrap"}, fmtDate(a.in_service_date)));
+      tr.appendChild(el("td",{class:"num",style:"text-align:right"}, fmt$(a.cost)));
+      tr.appendChild(el("td",{class:"num",style:"text-align:right"}, fmt$(dep)));
+      tr.appendChild(el("td",{class:"num",style:"text-align:right"}, fmt$(nbv)));
+      tr.appendChild(el("td",{}, el("span",{class:"chip "+(a.status==="active"?"ok":a.status==="disposed"?"err":"warn")}, a.status)));
+      tr.appendChild(el("td",{style:"white-space:nowrap;text-align:right"}, el("div",{style:"display:flex;gap:4px;justify-content:flex-end;flex-wrap:nowrap"},
+        el("button",{class:"btn ghost sm",onclick:()=>openAssetModal(a.id)},"Edit"),
+        el("button",{class:"btn ghost sm",onclick:()=>openScheduleModal(a.id)},"Schedule"),
+        a.status==="active" && el("button",{class:"btn ghost sm",onclick:()=>openTransferModal(a.id)},"Transfer"),
+        a.status==="active" && el("button",{class:"btn ghost sm",onclick:()=>openDisposalModal(a.id)},"Dispose"),
+      )));
+      return tr;
+    }
+
+    // Regular assets first
+    if (regular.length === 0 && Object.keys(propGroups).length === 0) {
+      tbody.appendChild(el("tr",{}, el("td",{colspan:"10",style:"color:var(--muted);padding:8px;text-align:center"},"No assets match. Click + Add asset.")));
+    }
+    regular.forEach(a => tbody.appendChild(subAssetRow(a, {indent:false})));
+
+    // Property folders
+    Object.keys(propGroups).sort().forEach(pname => {
+      const items = propGroups[pname];
+      const totalCost = items.reduce((s,a)=>s+(+a.cost||0)+(+a.improvements_cost||0),0);
+      const yTot = Depreciation.yearTotals(items.filter(a=>!a.is_land && a.status==="active"), y);
+      const nbv = totalCost - yTot.accumulated;
+      const anyStatus = items.some(a=>a.status==="active") ? "active" : items[0].status;
+      const anyEntity = byId(STATE.entities, items[0].entity_id);
+
+      let expanded = false;
+      const caret = el("span",{style:"display:inline-block;width:12px;color:var(--maroon);font-size:9px;transform:translateY(-1px)"},"▸");
+      // Parent row: clean cream background, subtle maroon left accent, no emoji, no gradient
+      const parentRow = el("tr",{style:"cursor:pointer;background:#f5efe3"});
+      parentRow.appendChild(el("td",{style:"text-align:center;border-left:3px solid var(--maroon)"}, caret));
+      parentRow.appendChild(el("td",{style:"padding:10px 6px"},
+        el("div",{style:"font-weight:600;font-size:14px;color:#2e2520"}, pname),
+        el("div",{class:"small",style:"font-weight:400;color:var(--muted);margin-top:2px"}, items.length+" sub-assets")
+      ));
+      parentRow.appendChild(el("td",{}, el("span",{class:"chip",style:"background:rgba(139,26,26,0.1);color:var(--maroon);border:1px solid rgba(139,26,26,0.2);font-weight:500"},"Property")));
+      parentRow.appendChild(el("td",{style:"white-space:nowrap"}, anyEntity?anyEntity.name:"—"));
+      parentRow.appendChild(el("td",{},""));
+      parentRow.appendChild(el("td",{class:"num",style:"text-align:right;font-weight:600"}, fmt$(totalCost)));
+      parentRow.appendChild(el("td",{class:"num",style:"text-align:right;font-weight:600"}, fmt$(yTot.depreciation)));
+      parentRow.appendChild(el("td",{class:"num",style:"text-align:right;font-weight:600"}, fmt$(nbv)));
+      parentRow.appendChild(el("td",{}, el("span",{class:"chip "+(anyStatus==="active"?"ok":"warn")}, anyStatus)));
+      parentRow.appendChild(el("td",{style:"white-space:nowrap;text-align:right"}, el("div",{style:"display:flex;gap:4px;justify-content:flex-end"},
+        el("button",{class:"btn ghost sm",onclick:(e)=>{e.stopPropagation(); openPropertyModal(pname);}},"Edit property")
+      )));
+
+      const subRows = items
+        .sort((a,b)=> (a.is_land?0:1)-(b.is_land?0:1) || (a.description||"").localeCompare(b.description||""))
+        .map(a => { const r = subAssetRow(a, {indent:true, propertyName:pname}); r.style.display = "none"; return r; });
+      parentRow.addEventListener("click", () => {
+        expanded = !expanded;
+        caret.textContent = expanded ? "▾" : "▸";
+        subRows.forEach(r => r.style.display = expanded ? "" : "none");
+      });
+      tbody.appendChild(parentRow);
+      subRows.forEach(r => tbody.appendChild(r));
     });
-    tblBd.appendChild(tableEl(
-      ["Description","Category","Entity","In service","Cost",{label:"Dep "+y,class:"num"},{label:"NBV "+y+" end",class:"num"},"Status","Actions"],
-      rows,
-      { empty:"No assets match. Click + Add asset." }
-    ));
+
+    tblBd.appendChild(tbl);
   }
   render();
 };
@@ -775,12 +864,12 @@ function categorySelect({allowAll=false, value=null, onchange=null}={}) {
 }
 
 // ---------- Asset create/edit modal ----------
-function openAssetModal(id, defaults) {
-  const a = id ? Object.assign({}, byId(STATE.assets, id)) : Object.assign({
+function openAssetModal(id) {
+  const a = id ? Object.assign({}, byId(STATE.assets, id)) : {
     description:"", cost:0, salvage_value:0, in_service_date: todayISO(),
     method:"ddb", life_years:5, convention:"half_year", bonus_pct:0, section_179:0,
     status:"active"
-  }, defaults || {});
+  };
   const f = {};
   function refreshPreview() {
     const prev = f.preview;
@@ -803,91 +892,309 @@ function openAssetModal(id, defaults) {
   const categoryChange = () => {
     const c = byId(STATE.categories, a.category_id);
     if (c) {
+      // Auto-flag land category as non-depreciating
+      if (c.name === "Land") { a.is_land = true; if (f.landChk) f.landChk.checked = true; }
       if (!id) { // only auto-fill on new
         if (c.default_method)     { a.method=c.default_method; f.method.value=a.method; }
         if (c.default_life_years) { a.life_years=c.default_life_years; f.life.value=a.life_years; }
         if (c.default_convention) { a.convention=c.default_convention; f.conv.value=a.convention; }
+        // Sensible defaults per property category (all straight-line, half-year)
+        const presets = {
+          "Residential Buildings":            { method:"sl", life_years:27.5, convention:"mid_month" },
+          "Commercial Buildings":             { method:"sl", life_years:39,   convention:"mid_month" },
+          "Agricultural Buildings":           { method:"sl", life_years:20,   convention:"half_year" },
+          "Capitalized Building Improvements":{ method:"sl", life_years:27.5, convention:"mid_month" },
+          "Land Improvements":                { method:"sl", life_years:15,   convention:"half_year" },
+          "Fencing":                          { method:"ddb", life_years:7,   convention:"half_year" },
+          "Farm Equipment":                   { method:"ddb", life_years:7,   convention:"half_year" },
+          "Furniture & Fixtures":             { method:"ddb", life_years:7,   convention:"half_year" },
+        };
+        const p = presets[c.name];
+        if (p) {
+          a.method = p.method; a.life_years = p.life_years; a.convention = p.convention;
+          if (f.method) f.method.value = p.method;
+          if (f.life)   f.life.value   = p.life_years;
+          if (f.conv)   f.conv.value   = p.convention;
+        }
       }
     }
-    if (f.propTypeHint) f.propTypeHint.textContent = effectivePropertyTypeLabel(a);
     refreshPreview();
   };
   const bindInput = (k, inp, num=false) => { inp.addEventListener("input", ()=>{ a[k] = num ? (+inp.value||0) : inp.value; refreshPreview(); }); return inp; };
 
-  const body = el("div",{class:"grid"},
+  // -------- Asset type — drives visibility --------
+  function inferType() {
+    if (a.pool_type === "recip_mare") return "recip_mare";
+    if (a.pool_type === "trading")    return "horse";
+    if (a.pool_type === "property")   return "building";
+    if (a.is_land)                    return "land";
+    const c = byId(STATE.categories, a.category_id);
+    if (c) {
+      if (/^Land$/i.test(c.name)) return "land";
+      if (/(Buildings|Improvements|Fencing|Land Improvements)/i.test(c.name)) return "building";
+      if (/(Recipient Mares)/i.test(c.name)) return "recip_mare";
+      if (/(Trading Horses|Horses)/i.test(c.name)) return "horse";
+    }
+    return "equipment";
+  }
+  let assetType = inferType();
+
+  const typeSel = el("select",{onchange:e=>{ assetType=e.target.value; applyType(); }},
+    el("option",{value:"equipment"},"Equipment / Machinery / Vehicle"),
+    el("option",{value:"building"}, "Building / Real Estate (improvement, fencing, land imp.)"),
+    el("option",{value:"recip_mare"},"Horse — Recip Mare"),
+    el("option",{value:"horse"},    "Horse — Stallion / Trading / Other"),
+    el("option",{value:"land"},     "Land (not depreciated)"),
+    el("option",{value:"other"},    "Other")
+  );
+  typeSel.value = assetType;
+
+  // -------- Common fields (always shown) --------
+  const blkCommon = el("div",{class:"grid"},
     el("div",{class:"grid cols-2"},
-      field("Description *", bindInput("description", el("input",{type:"text",value:a.description||""}))),
-      field("Asset # / tag",  bindInput("asset_number", el("input",{type:"text",value:a.asset_number||""}))),
+      field("Asset type *", typeSel),
+      field("Description *", bindInput("description", el("input",{type:"text",value:a.description||""})))
     ),
     el("div",{class:"grid cols-3"},
       field("Category", f.cat = categorySelect({value:a.category_id, onchange:v=>{a.category_id=v||null; categoryChange();}})),
       field("Entity *", f.ent = entitySelect({value:a.entity_id, onchange:v=>{a.entity_id=v||null;}})),
-      field("In-service date *", bindInput("in_service_date", el("input",{type:"date",value:a.in_service_date||todayISO()}))),
+      field("In-service date *", bindInput("in_service_date", el("input",{type:"date",value:a.in_service_date||todayISO()})))
+    )
+  );
+
+  // -------- Cost block (always shown; internal fields adapt to type) --------
+  const assetNumberField = field("Asset # / tag", bindInput("asset_number", el("input",{type:"text",value:a.asset_number||""})));
+  const blkCost = el("div",{class:"grid cols-3"},
+    field("Cost *", moneyInput({value:a.cost, onChange:v=>{a.cost=v; refreshPreview();}})),
+    assetNumberField,
+    field("Salvage value", moneyInput({value:a.salvage_value, onChange:v=>{a.salvage_value=v; refreshPreview();}}))
+  );
+
+  // -------- Property block (improvements + prior accum) — building only --------
+  const blkProperty = el("div",{class:"grid cols-3"},
+    field("Improvements (capitalized)", moneyInput({value:a.improvements_cost, onChange:v=>{a.improvements_cost=v; refreshPreview();}})),
+    field("Prior accum. dep. (pre-tracker)", moneyInput({value:a.prior_accum_dep, onChange:v=>{a.prior_accum_dep=v; refreshPreview();}})),
+    field("§179", moneyInput({value:a.section_179, onChange:v=>{a.section_179=v; refreshPreview();}}))
+  );
+
+  // -------- Machinery details (VIN, Make, Model, Year, Serial, Invoice, Vendor, Location) --------
+  const blkMachinery = el("div",{},
+    el("div",{style:"font-size:12px;color:var(--muted);margin:8px 0 4px;font-weight:600"},"Equipment details"),
+    el("div",{class:"grid cols-3"},
+      field("Make", bindInput("make", el("input",{type:"text",value:a.make||""}))),
+      field("Model", bindInput("model", el("input",{type:"text",value:a.model||""}))),
+      field("Year", bindInput("year", el("input",{type:"number",min:"1900",max:"2100",value:a.year||""}), true))
     ),
     el("div",{class:"grid cols-3"},
-      field("Cost / basis *", bindInput("cost", el("input",{type:"number",step:"0.01",min:"0",value:a.cost||0}), true)),
-      field("Salvage value",  bindInput("salvage_value", el("input",{type:"number",step:"0.01",min:"0",value:a.salvage_value||0}), true)),
-      field("§179", bindInput("section_179", el("input",{type:"number",step:"0.01",min:"0",value:a.section_179||0}), true)),
+      field("VIN", bindInput("vin", el("input",{type:"text",value:a.vin||""}))),
+      field("Serial #", bindInput("serial_number", el("input",{type:"text",value:a.serial_number||""}))),
+      field("Invoice #", bindInput("invoice_number", el("input",{type:"text",value:a.invoice_number||""})))
     ),
+    el("div",{class:"grid cols-3"},
+      field("Vendor", bindInput("vendor", el("input",{type:"text",value:a.vendor||""}))),
+      field("Location", bindInput("location", el("input",{type:"text",value:a.location||""}))),
+      field("§179", moneyInput({value:a.section_179, onChange:v=>{a.section_179=v; refreshPreview();}}))
+    )
+  );
+
+  // -------- Recip Mare block (bucket + mare#) --------
+  const bucketSel = el("select",{onchange:e=>{ a.bucket_tag=e.target.value; }},
+    ...["Solo Horses","Graves Purchase","Repro","Solo - Post Cutover"].map(b=>el("option",{value:b},b))
+  );
+  bucketSel.value = a.bucket_tag || "Solo - Post Cutover";
+  const blkRecip = el("div",{class:"grid cols-2"},
+    field("Bucket *", bucketSel),
+    field("Mare # (same as Asset #)", el("input",{type:"text",value:a.asset_number||"",oninput:e=>{a.asset_number=e.target.value;}}))
+  );
+
+  // -------- Horse/Trading block (ownership, co-owners, inventory) --------
+  const blkHorseTrading = el("div",{class:"grid cols-3"},
+    field("Solo ownership %", el("input",{type:"number",step:"0.0001",min:"0",max:"100",value:a.ownership_pct==null?100:a.ownership_pct,oninput:e=>a.ownership_pct=+e.target.value||0})),
+    field("Inventory (not depreciated)", (()=>{ const c=el("input",{type:"checkbox"}); c.checked=!!a.is_inventory; c.onchange=()=>{ a.is_inventory=c.checked; refreshPreview(); }; return c; })()),
+    field("Co-owners (name:% comma-sep)", el("input",{type:"text",placeholder:"John Smith:25, ABC LLC:10",value:(a.co_owners||[]).map(o=>o.name+":"+o.pct).join(", "),oninput:e=>{
+      a.co_owners = e.target.value.split(",").map(s=>s.trim()).filter(Boolean).map(pair=>{
+        const [name,pct] = pair.split(":").map(x=>x.trim());
+        return { name: name||"", pct: +pct||0 };
+      });
+    }}))
+  );
+
+  // -------- Horse pedigree (year, color, sex, sire, dam) --------
+  const blkPedigree = el("div",{},
+    el("div",{style:"font-size:12px;color:var(--muted);margin:8px 0 4px;font-weight:600"},"Horse pedigree"),
+    el("div",{class:"grid cols-3"},
+      field("Foaling year", el("input",{type:"number",min:"1900",max:"2100",value:a.foaling_year||"",oninput:e=>a.foaling_year=+e.target.value||null})),
+      field("Color (bay, chestnut, gray, ...)", el("input",{type:"text",value:a.color||"",oninput:e=>a.color=e.target.value})),
+      field("Sex (f/c/g/m/s/ri)", el("input",{type:"text",maxlength:"2",value:a.sex||"",oninput:e=>a.sex=e.target.value}))
+    ),
+    el("div",{class:"grid cols-2"},
+      field("Sire", el("input",{type:"text",value:a.sire||"",oninput:e=>a.sire=e.target.value})),
+      field("Dam",  el("input",{type:"text",value:a.dam||"",oninput:e=>a.dam=e.target.value}))
+    )
+  );
+  // -------- Depreciation block (always shown unless is_land) --------
+  const blkDep = el("div",{},
     el("div",{class:"grid cols-3"},
       field("Method *", f.method = (() => {
         const s = el("select",{});
         [["bonus","Bonus + DDB remainder"],["ddb","200% Declining Balance (DDB)"],["db150","150% Declining Balance"],["sl","Straight Line"]]
           .forEach(([v,l])=>s.appendChild(el("option",{value:v},l)));
-        s.value = a.method; s.onchange = () => { a.method=s.value; refreshPreview(); }; return s;
+        s.value = a.method||"ddb"; s.onchange = () => { a.method=s.value; refreshPreview(); }; return s;
       })()),
       field("Life (years) *", f.life = bindInput("life_years", el("input",{type:"number",step:"0.5",min:"0.5",value:a.life_years||5}), true)),
       field("Convention *", f.conv = (() => {
         const s = el("select",{});
         [["half_year","Half-Year"],["mid_quarter","Mid-Quarter"],["mid_month","Mid-Month (real property)"]]
           .forEach(([v,l])=>s.appendChild(el("option",{value:v},l)));
-        s.value = a.convention; s.onchange = () => { a.convention=s.value; refreshPreview(); }; return s;
-      })()),
+        s.value = a.convention||"half_year"; s.onchange = () => { a.convention=s.value; refreshPreview(); }; return s;
+      })())
     ),
-    el("div",{class:"grid cols-3"},
-      field("Bonus % (0–100)", bindInput("bonus_pct", el("input",{type:"number",step:"1",min:"0",max:"100",value:a.bonus_pct||0}), true)),
-      field("Location", bindInput("location", el("input",{type:"text",value:a.location||""}))),
-      field("Vendor",   bindInput("vendor", el("input",{type:"text",value:a.vendor||""}))),
-    ),
-    STATE.taxColsReady ? el("div",{class:"grid cols-2"},
-      field("Tax property type (Form 4797)", (() => {
-        const wrap = el("div",{});
-        const s = el("select",{onchange: e=>{ a.property_type = e.target.value || null; f.propTypeHint.textContent = effectivePropertyTypeLabel(a); }});
-        s.appendChild(el("option",{value:""}, "Use category / auto"));
-        Object.entries(PROP_TYPE_LABELS).forEach(([v,l])=>s.appendChild(el("option",{value:v},l)));
-        s.value = a.property_type || "";
-        wrap.appendChild(s);
-        f.propTypeHint = el("div",{class:"small",style:"margin-top:4px;color:var(--muted)"}, effectivePropertyTypeLabel(a));
-        wrap.appendChild(f.propTypeHint);
-        return wrap;
-      })()),
-      el("div",{},
-        el("div",{class:"small",style:"color:var(--muted);font-weight:600;margin-bottom:4px"}, "Prior depreciation (imported assets)"),
-        el("div",{class:"grid cols-2"},
-          field("Prior accum. dep.", bindInput("prior_depreciation", el("input",{type:"number",step:"0.01",min:"0",value:a.prior_depreciation||0}), true)),
-          field("Prior thru date",   bindInput("prior_through_date", el("input",{type:"date",value:a.prior_through_date||""}))),
-        ),
-        el("div",{class:"small",style:"color:var(--muted)"}, "Use when bringing in an asset that was already depreciating in another system (e.g. Ranch Management). The engine will resume booking after this date."),
-      ),
-    ) : el("div",{class:"msg warn",style:"font-size:12px"},
-      "Tax-form fields (property type, prior depreciation) are hidden until the database migration is run. Reports → Form 4797 / 4562 still work using sensible defaults."),
-    el("details",{},
-      el("summary",{style:"cursor:pointer;font-size:12px;color:var(--muted);margin-bottom:8px"},"More details (serial, VIN, notes)"),
-      el("div",{class:"grid cols-3"},
-        field("Serial #", bindInput("serial_number", el("input",{type:"text",value:a.serial_number||""}))),
-        field("VIN",      bindInput("vin", el("input",{type:"text",value:a.vin||""}))),
-        field("Invoice #",bindInput("invoice_number", el("input",{type:"text",value:a.invoice_number||""}))),
-      ),
-      el("div",{class:"grid cols-3"},
-        field("Make",  bindInput("make", el("input",{type:"text",value:a.make||""}))),
-        field("Model", bindInput("model", el("input",{type:"text",value:a.model||""}))),
-        field("Year",  bindInput("year", el("input",{type:"number",min:"1900",max:"2100",value:a.year||""}), true)),
-      ),
-      field("Notes", bindInput("notes", el("textarea",{}, a.notes||""))),
-    ),
-    el("h3",{style:"margin:18px 0 6px;font-size:14px"},"Depreciation preview"),
-    f.preview = el("div",{style:"max-height:280px;overflow:auto;border:1px solid var(--border);border-radius:6px;padding:4px"})
+    field("Bonus % (0–100)", bindInput("bonus_pct", el("input",{type:"number",step:"1",min:"0",max:"100",value:a.bonus_pct||0}), true))
   );
+
+  // -------- Live depreciable-basis summary --------
+  const basisBox = el("div",{class:"small",style:"background:#faf8f5;border:1px solid var(--border);border-radius:4px;padding:6px 10px;margin:-4px 0 4px"});
+  function renderBasisBox() {
+    const rawCost = +a.cost||0, imp = +a.improvements_cost||0;
+    const prior = +a.prior_accum_dep||0, sal = +a.salvage_value||0, s179 = +a.section_179||0;
+    const totalValue = rawCost + imp;
+    const depBasis = Math.max(totalValue - s179 - sal - prior, 0);
+    basisBox.innerHTML = "";
+    basisBox.appendChild(el("span",{},"Total value: "+fmt$(totalValue)));
+    if (imp)   basisBox.appendChild(el("span",{style:"margin-left:12px;color:var(--muted)"},"(incl. improvements)"));
+    if (prior) basisBox.appendChild(el("span",{style:"margin-left:12px;color:var(--muted)"},"− Prior accum "+fmt$(prior)));
+    if (s179)  basisBox.appendChild(el("span",{style:"margin-left:12px;color:var(--muted)"},"− §179 "+fmt$(s179)));
+    if (sal)   basisBox.appendChild(el("span",{style:"margin-left:12px;color:var(--muted)"},"− Salvage "+fmt$(sal)));
+    basisBox.appendChild(el("span",{style:"margin-left:12px;font-weight:600"},"→ Depreciable basis (pre-bonus): "+fmt$(depBasis)));
+  }
+  // Wrap refreshPreview so the basis box updates too
+  const _origRefresh = refreshPreview;
+  refreshPreview = function() { renderBasisBox(); _origRefresh(); };
+  renderBasisBox();
+
+  // -------- Notes (collapsed) --------
+  const blkNotes = el("details",{},
+    el("summary",{style:"cursor:pointer;font-size:12px;color:var(--muted);margin-bottom:8px"},"Notes"),
+    field("Notes", bindInput("notes", el("textarea",{}, a.notes||"")))
+  );
+
+  // -------- Photos section --------
+  const blkPhotos = (() => {
+    const wrap = el("details",{open: !!(a.photos && a.photos.length)},
+      el("summary",{style:"cursor:pointer;font-size:12px;color:var(--muted);margin-bottom:8px"},"Photos (up to 5)"));
+    const thumbs = el("div",{style:"display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px"});
+    const renderThumbs = () => {
+      thumbs.innerHTML = "";
+      (a.photos||[]).forEach((ph, idx) => {
+        const box = el("div",{style:"position:relative;width:96px;height:96px;border:1px solid var(--border);border-radius:6px;overflow:hidden"});
+        const img = el("img",{src: ph.url || ph, style:"width:100%;height:100%;object-fit:cover"});
+        const del = el("button",{class:"btn danger sm",style:"position:absolute;top:2px;right:2px;padding:2px 6px;font-size:10px",
+          onclick: async () => {
+            try { if (ph.path) await sb.storage.from("asset-photos").remove([ph.path]); } catch(e){}
+            a.photos = (a.photos||[]).filter((_,i)=>i!==idx);
+            renderThumbs();
+          }}, "×");
+        box.appendChild(img); box.appendChild(del);
+        thumbs.appendChild(box);
+      });
+    };
+    renderThumbs();
+    const fileInput = el("input",{type:"file",accept:"image/*",multiple:true,onchange:async(e)=>{
+      const files = Array.from(e.target.files||[]);
+      if (!files.length) return;
+      const existing = (a.photos||[]).length;
+      const room = Math.max(0, 5 - existing);
+      if (!room) { flash("Max 5 photos. Delete one first.","err"); fileInput.value=""; return; }
+      const toUpload = files.slice(0, room);
+      for (const file of toUpload) {
+        const ext = (file.name.split(".").pop()||"jpg").toLowerCase();
+        const path = "assets/" + (id||"new-"+Date.now()) + "/" + Date.now()+"-"+Math.random().toString(36).slice(2,8)+"."+ext;
+        const up = await sb.storage.from("asset-photos").upload(path, file, { contentType: file.type, upsert: false });
+        if (up.error) { flash("Upload failed: "+up.error.message,"err"); continue; }
+        const { data: pub } = sb.storage.from("asset-photos").getPublicUrl(path);
+        a.photos = (a.photos||[]).concat([{ path, url: pub.publicUrl }]);
+        renderThumbs();
+      }
+      fileInput.value = "";
+      if (files.length > room) flash("Only "+room+" uploaded (5-photo limit).","warn");
+    }});
+    wrap.appendChild(thumbs);
+    wrap.appendChild(el("div",{class:"small",style:"color:var(--muted);margin-bottom:6px"},"JPEG/PNG. Max 5 per asset."));
+    wrap.appendChild(fileInput);
+    return wrap;
+  })();
+
+  // -------- Preview --------
+  f.preview = el("div",{style:"max-height:280px;overflow:auto;border:1px solid var(--border);border-radius:6px;padding:4px"});
+  const blkPreview = el("div",{},
+    el("h3",{style:"margin:18px 0 6px;font-size:14px"},"Depreciation preview"),
+    f.preview
+  );
+
+  // -------- Assemble body --------
+  const body = el("div",{class:"grid"},
+    blkCommon, blkCost, blkMachinery, blkProperty, blkRecip, blkHorseTrading, blkPedigree,
+    basisBox, blkDep, blkNotes, blkPhotos, blkPreview
+  );
+
+  // -------- applyType: show/hide blocks based on assetType --------
+  function applyType() {
+    const t = assetType;
+    blkMachinery.style.display     = t === "equipment" ? "" : "none";
+    blkProperty.style.display      = t === "building"  ? "" : "none";
+    blkRecip.style.display         = t === "recip_mare" ? "" : "none";
+    blkHorseTrading.style.display  = t === "horse"     ? "" : "none";
+    blkPedigree.style.display      = (t === "horse" || t === "recip_mare") ? "" : "none";
+    blkDep.style.display           = t === "land"      ? "none" : "";
+    basisBox.style.display         = t === "land"      ? "none" : "";
+    blkPreview.style.display       = t === "land"      ? "none" : "";
+
+    // Sync data flags
+    a.is_land = (t === "land");
+    a.pool_type = (t === "recip_mare") ? "recip_mare"
+                : (t === "horse")      ? "trading"
+                : (a.pool_type === "property") ? "property"
+                : null;
+
+    // Apply smart defaults on type switch (new records only)
+    if (!id) {
+      if (t === "equipment") {
+        if (!a.method || a.method === "sl") a.method = "ddb";
+        if (!a.life_years) a.life_years = 5;
+        if (!a.convention) a.convention = "half_year";
+      } else if (t === "building") {
+        a.method = a.method || "sl";
+        a.life_years = a.life_years || 27.5;
+        a.convention = a.convention || "mid_month";
+      } else if (t === "recip_mare" || t === "horse") {
+        a.method = a.method || "bonus";
+        a.life_years = a.life_years || 7;
+        a.convention = a.convention || "half_year";
+        if (!a.bonus_pct) {
+          const acq = a.in_service_date ? new Date(a.in_service_date) : new Date();
+          a.bonus_pct = (acq >= new Date("2025-01-20")) ? 100 : 0;
+        }
+        if (t === "recip_mare" && !a.bucket_tag) { a.bucket_tag = "Solo - Post Cutover"; bucketSel.value = a.bucket_tag; }
+        if (t === "recip_mare" && !a.category_id) {
+          const cat = STATE.categories.find(c=>c.name==="Recipient Mares");
+          if (cat) { a.category_id = cat.id; if (f.cat) f.cat.value = cat.id; }
+        }
+        if (t === "horse" && !a.category_id) {
+          const cat = STATE.categories.find(c=>c.name==="Trading Horses");
+          if (cat) { a.category_id = cat.id; if (f.cat) f.cat.value = cat.id; }
+        }
+      } else if (t === "land") {
+        const cat = STATE.categories.find(c=>c.name==="Land");
+        if (cat && !a.category_id) { a.category_id = cat.id; if (f.cat) f.cat.value = cat.id; }
+      }
+      if (f.method) f.method.value = a.method || "ddb";
+      if (f.life)   f.life.value   = a.life_years || 5;
+      if (f.conv)   f.conv.value   = a.convention || "half_year";
+    }
+    refreshPreview();
+  }
+  // Initial apply
+  setTimeout(applyType, 0);
   refreshPreview();
 
   const footer = el("div",{class:"ft"},
@@ -901,14 +1208,6 @@ function openAssetModal(id, defaults) {
         flash("Description, entity, cost, in-service date are required","err"); return;
       }
       const payload = Object.assign({}, a); delete payload.categories; delete payload.entities;
-      // Normalize empty optional fields → null so Postgres typed columns accept them.
-      if (payload.prior_through_date === "" || payload.prior_through_date == null) payload.prior_through_date = null;
-      if (!payload.prior_depreciation) payload.prior_depreciation = 0;
-      if (payload.property_type === "" || payload.property_type == null) payload.property_type = null;
-      // If the migration hasn't been run yet, drop these keys so Postgres doesn't reject the row.
-      if (!STATE.taxColsReady) {
-        delete payload.property_type; delete payload.prior_depreciation; delete payload.prior_through_date;
-      }
       if (!id) { payload.created_by = USER.email; }
       let saved;
       try { saved = await upsert("assets", payload); }
@@ -1080,16 +1379,44 @@ function openDisposalModal(assetId) {
     preview.appendChild(sched);
   }
   const preview = el("div",{style:"background:#faf8f5;border-radius:6px;margin-top:10px;padding:12px"});
+  // Extended disposal fields: donated (with FMV), partial_sale (with ownership_pct_sold).
+  rec.fmv = 0;
+  rec.ownership_pct_sold = 100;
+  rec.is_partial = false;
+  const typeOptions = [
+    ["sold","Sold"],["donated","Donated (FMV)"],["scrapped","Scrapped"],["traded","Traded"],
+    ["lost","Lost"],["died","Died"],["partial_sale","Partial Sale (Trading only)"],["other","Other"]
+  ];
+  const fmvField = field("Donation FMV *", el("input",{type:"number",step:"0.01",min:"0",value:0,oninput:e=>{rec.fmv=+e.target.value||0; refreshCalc();}}));
+  const pctField = field("% of ownership sold *", el("input",{type:"number",step:"0.0001",min:"0.0001",max:"100",value:100,oninput:e=>{rec.ownership_pct_sold=+e.target.value||0; refreshCalc();}}));
+  fmvField.style.display = "none";
+  pctField.style.display = "none";
+  const typeSel = el("select",{onchange:e=>{
+    rec.disposal_type = e.target.value;
+    rec.is_partial = (rec.disposal_type === "partial_sale");
+    fmvField.style.display = (rec.disposal_type === "donated") ? "" : "none";
+    pctField.style.display = rec.is_partial ? "" : "none";
+    refreshCalc();
+  }});
+  typeOptions.forEach(([v,l]) => typeSel.appendChild(el("option",{value:v}, l)));
+  typeSel.value = "sold";
+
   modal({ title:"Dispose — "+a.description,
     body: el("div",{class:"grid"},
+      (a.pool_type === "recip_mare")
+        ? el("div",{class:"msg warn"},"Recip Mare: full-mare disposal. Use Sold / Died / Donated. For donations enter FMV.")
+        : (a.pool_type === "trading")
+          ? el("div",{class:"msg warn"},"Trading horse: Partial Sale lets you reduce ownership % without retiring the asset. Gain/loss is pro-rata.")
+          : null,
       el("div",{class:"grid cols-2"},
         field("Disposal date *", el("input",{type:"date",value:rec.disposal_date,oninput:e=>{rec.disposal_date=e.target.value; refreshCalc();}})),
-        field("Type", (()=>{const s=el("select",{onchange:e=>{rec.disposal_type=e.target.value;}}); ["sold","scrapped","traded","lost","other"].forEach(t=>s.appendChild(el("option",{value:t},t))); s.value="sold"; return s;})()),
+        field("Type", typeSel),
       ),
       el("div",{class:"grid cols-2"},
-        field("Proceeds", el("input",{type:"number",step:"0.01",min:"0",value:0,oninput:e=>{rec.proceeds=+e.target.value||0; refreshCalc();}})),
+        field("Proceeds (cash received)", el("input",{type:"number",step:"0.01",min:"0",value:0,oninput:e=>{rec.proceeds=+e.target.value||0; refreshCalc();}})),
         field("Buyer / note", el("input",{type:"text",oninput:e=>rec.buyer=e.target.value})),
       ),
+      el("div",{class:"grid cols-2"}, fmvField, pctField),
       field("Notes", el("textarea",{oninput:e=>rec.notes=e.target.value})),
       el("h3",{style:"margin:10px 0 2px;font-size:13px"},"Gain / loss preview"),
       preview
@@ -1097,20 +1424,53 @@ function openDisposalModal(assetId) {
     saveLabel:"Record disposal",
     onSave: async () => {
       if (!rec.disposal_date) throw new Error("Pick a disposal date");
-      // Re-check latest server state — prevent double-dispose.
-      const { data: latest } = await sb.from("assets").select("status").eq("id", a.id).single();
-      if (latest && latest.status === "disposed") throw new Error("This asset is already disposed. Refresh the page.");
-      // Future date? Warn but allow.
+      // Re-check latest server state — prevent double-dispose (except for partial sales).
+      const { data: latest } = await sb.from("assets").select("status,cost,ownership_pct").eq("id", a.id).single();
+      if (latest && latest.status === "disposed" && !rec.is_partial) {
+        throw new Error("This asset is already disposed. Refresh the page.");
+      }
       if (rec.disposal_date > todayISO()) {
         if (!confirm("Disposal date "+rec.disposal_date+" is in the future. Record it anyway?")) return;
       }
+      // Validate partial-sale specifics
+      if (rec.is_partial) {
+        if (a.pool_type !== "trading") throw new Error("Partial sales are only supported on Trading horses.");
+        const pct = +rec.ownership_pct_sold || 0;
+        if (pct <= 0 || pct > 100) throw new Error("Partial sale % must be between 0 and 100.");
+        const currentPct = +(latest && latest.ownership_pct != null ? latest.ownership_pct : a.ownership_pct) || 0;
+        if (pct > currentPct) throw new Error("Selling "+pct+"% but Solo only owns "+currentPct+"%.");
+      }
+      if (rec.disposal_type === "donated" && !(rec.fmv > 0)) {
+        throw new Error("Enter the donation FMV (>0).");
+      }
+      // Snapshot cost/accum/nbv at disposal for audit trail
+      {
+        const sched = Depreciation.schedule(Object.assign({}, a, { disposal_date: rec.disposal_date }));
+        const last = sched[sched.length-1];
+        const acc = last ? last.accumulated : 0;
+        const nbv = (+a.cost||0) - acc;
+        rec.cost_retired      = rec.is_partial ? r2((+a.cost||0) * (rec.ownership_pct_sold/100)) : (+a.cost||0);
+        rec.accum_dep_retired = rec.is_partial ? r2(acc * (rec.ownership_pct_sold/100)) : r2(acc);
+        rec.nbv_retired       = rec.is_partial ? r2(nbv * (rec.ownership_pct_sold/100)) : r2(nbv);
+      }
       rec.created_by = USER.email;
       const saved = await insertRec("disposals", rec);
-      await updateRec("assets", a.id, { status: "disposed", updated_at: new Date().toISOString() });
-      await logActivity("asset", a.id, "dispose",
-        "Disposed ("+rec.disposal_type+"): proceeds "+fmt$(rec.proceeds||0)+" on "+rec.disposal_date,
-        { disposal_id: saved.id });
-      await refreshAll(); show("assets"); flash("Disposal recorded");
+      if (rec.is_partial) {
+        // Reduce asset cost + ownership_pct pro-rata; asset stays ACTIVE.
+        const newCost = r2((+a.cost||0) * (1 - rec.ownership_pct_sold/100));
+        const newOwn  = r2((+a.ownership_pct||100) - rec.ownership_pct_sold);
+        await updateRec("assets", a.id, { cost: newCost, ownership_pct: newOwn, updated_at: new Date().toISOString() });
+        await logActivity("asset", a.id, "partial_sale",
+          "Partial sale: "+rec.ownership_pct_sold+"% at "+fmt$(rec.proceeds||0)+" on "+rec.disposal_date+". Cost reduced to "+fmt$(newCost)+", Solo ownership now "+newOwn+"%.",
+          { disposal_id: saved.id });
+      } else {
+        await updateRec("assets", a.id, { status: "disposed", disposal_date: rec.disposal_date, updated_at: new Date().toISOString() });
+        const summary = "Disposed ("+rec.disposal_type+"): "+
+          (rec.disposal_type==="donated" ? "FMV "+fmt$(rec.fmv||0) : "proceeds "+fmt$(rec.proceeds||0)) +
+          " on "+rec.disposal_date;
+        await logActivity("asset", a.id, "dispose", summary, { disposal_id: saved.id });
+      }
+      await refreshAll(); show("assets"); flash(rec.is_partial ? "Partial sale recorded" : "Disposal recorded");
     }
   });
   refreshCalc();
@@ -1229,10 +1589,10 @@ VIEWS.asset = async function(root, ctx) {
     ["Category", c?c.name:"—"],
     ["Entity", e?e.name:"—"],
     ["In-service date", fmtDate(a.in_service_date)],
-    ["Method", METHOD_LABELS[a.method]||a.method],
-    ["Life", (a.life_years||"")+" years"],
-    ["Convention", CONV_LABELS[a.convention]||a.convention],
-    ["Bonus %", (a.bonus_pct||0)+"%"],
+    ["Method", a.is_inventory ? "Inventory (not depreciated)" : (METHOD_LABELS[a.method]||a.method)],
+    ["Life", a.is_inventory ? "—" : (a.life_years||"")+" years"],
+    ["Convention", a.is_inventory ? "—" : (CONV_LABELS[a.convention]||a.convention)],
+    ["Bonus %", a.is_inventory ? "—" : (a.bonus_pct||0)+"%"],
     ["§179", fmt$(a.section_179||0)],
     ["Salvage", fmt$(a.salvage_value||0)],
     ["Location", a.location||"—"],
@@ -1240,14 +1600,45 @@ VIEWS.asset = async function(root, ctx) {
     ["Invoice #", a.invoice_number||"—"],
     ["Notes", a.notes||"—"],
   ];
+  if (a.pool_type) {
+    const poolLabel = a.pool_type==="recip_mare" ? "Recip Mare"
+                    : a.pool_type==="trading"    ? "Horse (trading/stallion)"
+                    : a.pool_type==="property"   ? "Property sub-asset" : a.pool_type;
+    rows.unshift(["Pool", poolLabel]);
+    if (a.property_group) {
+      const link = el("a",{href:"#",style:"color:var(--maroon)",onclick:ev=>{ev.preventDefault(); show("properties");}}, a.property_group);
+      rows.splice(1,0, ["Property", link]);
+    }
+    if (a.bucket_tag) rows.splice(1,0, ["Bucket", a.bucket_tag]);
+    if (a.pool_type==="trading") rows.splice(1,0, ["Solo ownership", (a.ownership_pct==null?100:a.ownership_pct)+"%"]);
+    if (a.foaling_year||a.color||a.sex||a.sire||a.dam) rows.splice(1,0, ["Horse", horseDisplayName(a) || "—"]);
+    if ((a.co_owners||[]).length) rows.splice(2,0, ["Co-owners", a.co_owners.map(o=>o.name+" "+o.pct+"%").join(", ")]);
+  }
+  if (a.is_land) rows.unshift(["Land", "Not depreciated"]);
   rows.forEach(([k,v])=>info.appendChild(el("tr",{},
     el("td",{style:"color:var(--muted);width:40%;font-size:12px"}, k),
     el("td",{style:"font-weight:500"}, v)
   )));
   grid.appendChild(card("Details", info));
 
-  // Chart: bar chart of NBV and depreciation over schedule years
-  grid.appendChild(card("Depreciation by year", buildDepChart(actualSchedule)));
+  // Chart: bar chart of NBV and depreciation over schedule years (skip for inventory)
+  if (!a.is_inventory && actualSchedule.length) {
+    grid.appendChild(card("Depreciation by year", buildDepChart(actualSchedule)));
+  } else if (a.is_inventory) {
+    grid.appendChild(card("Inventory item", el("div",{class:"small"},
+      "Not depreciated. Cost sits on the balance sheet until sold, at which point it hits COGS.")));
+  }
+
+  // Photos strip
+  if ((a.photos||[]).length) {
+    const photoStrip = el("div",{style:"display:flex;flex-wrap:wrap;gap:8px;padding:8px"});
+    a.photos.forEach(ph => {
+      photoStrip.appendChild(el("a",{href: ph.url||ph, target:"_blank"},
+        el("img",{src: ph.url||ph, style:"width:140px;height:140px;object-fit:cover;border-radius:6px;border:1px solid var(--border)"})
+      ));
+    });
+    root.appendChild(card("Photos ("+a.photos.length+")", photoStrip));
+  }
 
   // Full schedule (compact) — uses actual (disposal-aware) schedule
   root.appendChild(card(disp?"Schedule (with disposal applied)":"Schedule", tableEl(
@@ -1365,26 +1756,34 @@ VIEWS.disposals = function(root) {
   const rows = STATE.disposals.map(d => {
     const a = byId(STATE.assets, d.asset_id);
     let gainLoss = "";
-    if (a) {
+    // Prefer snapshot fields (cost_retired/accum_dep_retired/nbv_retired) if present.
+    const nbvRetired = d.nbv_retired != null ? +d.nbv_retired : null;
+    const considered = (d.disposal_type === "donated" ? (+d.fmv||0) : (+d.proceeds||0));
+    if (nbvRetired != null) {
+      gainLoss = fmt$(considered - nbvRetired);
+    } else if (a) {
       const a2 = Object.assign({}, a, { disposal_date: d.disposal_date });
       const rs = Depreciation.schedule(a2);
       const acc = rs.length ? rs[rs.length-1].accumulated : 0;
       const nbv = (+a.cost||0) - acc;
-      const gl = (+d.proceeds||0) - nbv;
-      gainLoss = fmt$(gl);
+      gainLoss = fmt$(considered - nbv);
     }
     const assetLink = a ? (() => {
       const L = el("a",{href:"#",style:"color:var(--maroon);cursor:pointer"},a.description);
       L.onclick = ev=>{ev.preventDefault(); show("asset",{id:a.id});};
       return L;
     })() : "(deleted asset)";
+    const typeLabel = (d.disposal_type||"") + (d.is_partial ? " ("+(d.ownership_pct_sold||0)+"%)" : "");
+    const proceedsShown = d.disposal_type === "donated"
+      ? "FMV "+fmt$(d.fmv||0)+(d.proceeds?" + $"+(+d.proceeds||0):"")
+      : fmt$(d.proceeds||0);
     return [
       fmtDate(d.disposal_date),
       assetLink,
-      d.disposal_type || "",
-      {class:"num",value:a?fmt$(a.cost):""},
-      {class:"num",value:fmt$(d.proceeds||0)},
-      {class:"num",value:gainLoss},
+      typeLabel,
+      {class:"num",value: d.cost_retired != null ? fmt$(d.cost_retired) : (a?fmt$(a.cost):"")},
+      {class:"num",value: proceedsShown},
+      {class:"num",value: gainLoss},
       d.buyer || "",
       d.notes || "",
       d.created_by || "",
@@ -1395,21 +1794,34 @@ VIEWS.disposals = function(root) {
     ];
   });
   root.appendChild(card(null, tableEl(
-    ["Date","Asset","Type",{label:"Cost",class:"num"},{label:"Proceeds",class:"num"},{label:"Gain/(Loss)",class:"num"},"Buyer","Notes","By","Actions"], rows,
+    ["Date","Asset","Type",{label:"Cost / Retired",class:"num"},{label:"Proceeds / FMV",class:"num"},{label:"Gain/(Loss)",class:"num"},"Buyer","Notes","By","Actions"], rows,
     {empty:"No disposals yet."}
   )));
 };
 async function unwindDisposal(dispId) {
   const d = byId(STATE.disposals, dispId); if (!d) return;
   const a = byId(STATE.assets, d.asset_id);
-  confirmModal("Unwind this disposal? The asset ("+(a?a.description:"unknown")+") will be set back to active and the disposal record removed.",
+  const isPartial = !!d.is_partial;
+  const msg = isPartial
+    ? "Unwind this partial sale? "+(d.ownership_pct_sold||0)+"% will be added back to Solo's ownership and the cost restored."
+    : "Unwind this disposal? The asset ("+(a?a.description:"unknown")+") will be set back to active and the disposal record removed.";
+  confirmModal(msg,
     async () => {
       await remove("disposals", dispId);
-      if (a) await updateRec("assets", a.id, { status:"active", updated_at:new Date().toISOString() });
+      if (a) {
+        if (isPartial) {
+          // Restore cost (add back the retired portion) + ownership_pct
+          const restoredCost = r2((+a.cost||0) + (+d.cost_retired||0));
+          const restoredOwn  = r2((+a.ownership_pct||0) + (+d.ownership_pct_sold||0));
+          await updateRec("assets", a.id, { cost: restoredCost, ownership_pct: restoredOwn, updated_at: new Date().toISOString() });
+        } else {
+          await updateRec("assets", a.id, { status:"active", disposal_date: null, updated_at:new Date().toISOString() });
+        }
+      }
       await logActivity("asset", a?a.id:null, "unwind_dispose",
-        "Unwound disposal dated "+fmtDate(d.disposal_date)+" ("+(d.disposal_type||"")+", proceeds "+fmt$(d.proceeds||0)+")",
+        "Unwound "+(isPartial?"partial sale":"disposal")+" dated "+fmtDate(d.disposal_date)+" ("+(d.disposal_type||"")+", proceeds "+fmt$(d.proceeds||0)+(d.fmv?", FMV "+fmt$(d.fmv):"")+")",
         { disposal_id: dispId });
-      await refreshAll(); show("disposals"); flash("Disposal unwound");
+      await refreshAll(); show("disposals"); flash((isPartial?"Partial sale":"Disposal")+" unwound");
     });
 }
 function openDisposalEditModal(dispId) {
@@ -1452,7 +1864,7 @@ VIEWS.entities = function(root) {
   const rows = STATE.entities.map(e => {
     const assetCount = STATE.assets.filter(a=>a.entity_id===e.id && a.status==="active").length;
     const link = el("a",{href:"#",style:"color:var(--maroon);text-decoration:none;font-weight:600;cursor:pointer"}, e.name);
-    link.onclick = (ev) => { ev.preventDefault(); show("entity", {id: e.id}); };
+    link.onclick = (ev) => { ev.preventDefault(); show("assets",{entity_id: e.id, status:""}); };
     return [
     link,
     e.parent_group || "—",
@@ -1469,115 +1881,6 @@ VIEWS.entities = function(root) {
   ];});
   root.appendChild(card(null, tableEl(["Name","Group","Type","Ownership",{label:"Active assets",class:"num"},"Actions"], rows)));
 };
-
-// ============================================================
-// VIEW: Entity (property) detail — landing page for one entity
-// ============================================================
-VIEWS.entity = function(root, ctx) {
-  const id = ctx && ctx.id;
-  const e = byId(STATE.entities, id);
-  if (!e) { root.appendChild(el("p",{}, "Entity not found.")); return; }
-
-  const y = thisYear();
-  const all = STATE.assets.filter(a => a.entity_id === e.id);
-  const active = all.filter(a => a.status === "active");
-  const disposed = all.filter(a => a.status === "disposed");
-  const tot = Depreciation.yearTotals(active, y);
-
-  // Header + back link
-  root.appendChild(el("div",{style:"margin-bottom:10px"},
-    el("a",{href:"#",style:"color:var(--maroon);text-decoration:none",
-      onclick:ev=>{ev.preventDefault(); show("entities");}}, "← Back to entities")
-  ));
-  root.appendChild(el("h2",{}, e.name, " ",
-    el("small",{},(e.entity_type||"")+(e.parent_group?" · "+e.parent_group:""))));
-  root.appendChild(el("div",{class:"small",style:"margin-bottom:14px"},
-    [e.tax_id, e.address, e.notes, e.ownership_pct!=null?(e.ownership_pct+"% owned"):null]
-      .filter(Boolean).join(" · ") || ""));
-
-  // KPI row
-  root.appendChild(el("div",{class:"kpi-row"},
-    kpi("Active assets", String(active.length), all.length===active.length ? null : (all.length-active.length)+" disposed"),
-    kpi("Total cost", fmt$(tot.cost), null),
-    kpi("Accumulated dep.", fmt$(tot.accumulated), "thru EOY "+(y-1)+" + "+y+" YTD"),
-    kpi("Net book value", fmt$(tot.nbv), null),
-    kpi(y+" depreciation", fmt$(tot.depreciation), null),
-  ));
-
-  // Action buttons
-  root.appendChild(el("div",{style:"margin:10px 0 16px"},
-    el("button",{class:"btn",onclick:()=>openAssetModal(null, {entity_id: e.id})}, "+ Add asset to this entity"),
-    " ",
-    el("button",{class:"btn ghost",onclick:()=>editEntity(e.id)}, "Edit entity"),
-  ));
-
-  // Active assets table
-  if (active.length) {
-    const rows = active.map(a => {
-      const c = byId(STATE.categories, a.category_id);
-      const sched = Depreciation.schedule(a, y).find(r=>r.year===y);
-      const yDep = sched ? sched.total_expense : 0;
-      const nbv = sched ? sched.closing_nbv : (+a.cost||0);
-      const link = el("a",{href:"#",style:"color:var(--maroon);text-decoration:none;font-weight:600;cursor:pointer"},
-        a.description + (a.asset_number ? " ("+a.asset_number+")" : ""));
-      link.onclick = (ev)=>{ ev.preventDefault(); show("asset",{id:a.id}); };
-      return [link, c?c.name:"—", fmtDate(a.in_service_date),
-        {class:"num",value:fmt$(a.cost)},
-        {class:"num",value:fmt$(yDep)},
-        {class:"num",value:fmt$(nbv)},
-        a.location||""];
-    });
-    root.appendChild(card("Active assets — "+active.length,
-      tableEl(["Asset","Category","In service",
-        {label:"Cost",class:"num"},{label:y+" dep.",class:"num"},{label:"NBV",class:"num"},
-        "Location"], rows)));
-  } else {
-    root.appendChild(card("Active assets", el("p",{class:"small"},"No active assets under this entity yet.")));
-  }
-
-  // Recent transfers in/out
-  const involvedTransfers = STATE.transfers.filter(t =>
-    t.from_entity_id === e.id || t.to_entity_id === e.id);
-  if (involvedTransfers.length) {
-    const rows = involvedTransfers.slice(0, 25).map(t => {
-      const a = byId(STATE.assets, t.asset_id);
-      const fromE = byId(STATE.entities, t.from_entity_id);
-      const toE = byId(STATE.entities, t.to_entity_id);
-      const direction = t.from_entity_id === e.id ? "→ out" : "← in";
-      return [fmtDate(t.transfer_date), a?a.description:"—",
-        direction, fromE?fromE.name:"—", toE?toE.name:"—", t.reason||""];
-    });
-    root.appendChild(card("Transfers — "+involvedTransfers.length,
-      tableEl(["Date","Asset","Direction","From","To","Reason"], rows)));
-  }
-
-  // Disposals from this entity
-  if (disposed.length) {
-    const rows = disposed.map(a => {
-      const d = STATE.disposals.find(x => x.asset_id === a.id);
-      if (!d) return null;
-      const a2 = Object.assign({}, a, { disposal_date: d.disposal_date });
-      const sched = Depreciation.schedule(a2);
-      const last = sched[sched.length-1];
-      const acc = last ? last.accumulated : 0;
-      const basis = (+a.cost||0) - acc;
-      const gl = (+d.proceeds||0) - basis;
-      const link = el("a",{href:"#",style:"color:var(--maroon);text-decoration:none;cursor:pointer"},
-        a.description);
-      link.onclick = (ev)=>{ ev.preventDefault(); show("asset",{id:a.id}); };
-      return [fmtDate(d.disposal_date), link, d.disposal_type||"",
-        {class:"num",value:fmt$(a.cost)},
-        {class:"num",value:fmt$(d.proceeds||0)},
-        {class:"num",value:fmt$(gl)}];
-    }).filter(Boolean);
-    if (rows.length) {
-      root.appendChild(card("Disposed assets — "+rows.length,
-        tableEl(["Date","Asset","Type",{label:"Cost",class:"num"},
-          {label:"Proceeds",class:"num"},{label:"Gain/(Loss)",class:"num"}], rows)));
-    }
-  }
-};
-
 function editEntity(id) {
   const e = id ? Object.assign({}, byId(STATE.entities, id)) : { name:"", parent_group:"", entity_type:"operating", ownership_pct:100, active:true };
   modal({ title: id?"Edit entity":"Add entity",
@@ -1619,7 +1922,7 @@ VIEWS.categories = function(root) {
   root.appendChild(card(null, tableEl(["Name","Default method","Life","Convention","Actions"], rows)));
 };
 function editCategory(id) {
-  const c = id ? Object.assign({}, byId(STATE.categories, id)) : { name:"", default_method:"ddb", default_life_years:5, default_convention:"half_year", property_type:"1245", color:"#8b1a1a", sort_order:100 };
+  const c = id ? Object.assign({}, byId(STATE.categories, id)) : { name:"", default_method:"ddb", default_life_years:5, default_convention:"half_year", color:"#8b1a1a", sort_order:100 };
   modal({ title: id?"Edit category":"Add category",
     body: el("div",{class:"grid"},
       field("Name *", el("input",{type:"text",value:c.name||"",oninput:e=>c.name=e.target.value})),
@@ -1628,20 +1931,12 @@ function editCategory(id) {
         field("Default life (yrs)", el("input",{type:"number",step:"0.5",value:c.default_life_years||5,oninput:e=>c.default_life_years=+e.target.value||0})),
         field("Default convention", (()=>{const s=el("select",{onchange:e=>c.default_convention=e.target.value}); [["half_year","Half-Year"],["mid_quarter","Mid-Quarter"],["mid_month","Mid-Month"]].forEach(([v,l])=>s.appendChild(el("option",{value:v},l))); s.value=c.default_convention||"half_year"; return s;})()),
       ),
-      STATE.taxColsReady ? field("Tax property type (Form 4797)", (()=>{
-        const s=el("select",{onchange:e=>c.property_type=e.target.value});
-        Object.entries(PROP_TYPE_LABELS).forEach(([v,l])=>s.appendChild(el("option",{value:v},l)));
-        s.value=c.property_type||"1245"; return s;
-      })()) : null,
       field("Color", el("input",{type:"color",value:c.color||"#8b1a1a",oninput:e=>c.color=e.target.value})),
       field("Sort order", el("input",{type:"number",value:c.sort_order||100,oninput:e=>c.sort_order=+e.target.value||0}))
     ),
     onSave: async() => {
       if (!c.name) throw new Error("Name required");
-      if (!c.property_type) c.property_type = "1245";
-      const payload = Object.assign({}, c);
-      if (!STATE.taxColsReady) delete payload.property_type;
-      await upsert("categories", payload); await refreshAll(); show("categories"); flash("Saved");
+      await upsert("categories", c); await refreshAll(); show("categories"); flash("Saved");
     }
   });
 }
@@ -1650,44 +1945,60 @@ function editCategory(id) {
 // VIEW: Reports
 // ============================================================
 VIEWS.reports = function(root) {
-  const st = { year: thisYear(), type: "rollforward", asOfMode:"ytd", customDate: todayISO() };
+  const y = thisYear();
+  const st = {
+    year: y, type: "rollforward",
+    dateMode: "year", // 'year' | 'period'
+    periodStart: y+"-01-01", periodEnd: todayISO(),
+    asOfMode: "ytd", customDate: todayISO(),
+    groupBy: "entity_category", // 'none' | 'entity' | 'entity_category'
+    showMonthly: false
+  };
 
-  // Compute as-of date from mode
   function asOfDate() {
     if (st.asOfMode === "ytd") return todayISO();
     if (st.asOfMode === "eoy") return st.year + "-12-31";
     if (st.asOfMode === "custom") return st.customDate || todayISO();
-    return null; // full year
+    return null;
   }
 
   root.appendChild(el("h2",{},"Reports"));
-  if (!STATE.taxColsReady) root.appendChild(migrationBanner());
-  // Build custom-date field first so we can toggle it from the As-of select
+
+  // Period fields (toggled by dateMode)
+  const periodFields = el("div",{style:"display:flex;gap:8px;align-items:flex-end"},
+    field("Start", el("input",{type:"date",value:st.periodStart,oninput:e=>{st.periodStart=e.target.value; render();}})),
+    field("End",   el("input",{type:"date",value:st.periodEnd,  oninput:e=>{st.periodEnd=e.target.value;   render();}})),
+    el("button",{class:"btn ghost sm",style:"margin-bottom:2px",onclick:()=>{const d=new Date(); st.periodStart=d.getUTCFullYear()+"-"+String(d.getUTCMonth()+1).padStart(2,"0")+"-01"; st.periodEnd=todayISO(); render();}},"This month"),
+    el("button",{class:"btn ghost sm",style:"margin-bottom:2px",onclick:()=>{const d=new Date(); const q=Math.floor(d.getUTCMonth()/3); st.periodStart=d.getUTCFullYear()+"-"+String(q*3+1).padStart(2,"0")+"-01"; st.periodEnd=todayISO(); render();}},"This quarter"),
+    el("button",{class:"btn ghost sm",style:"margin-bottom:2px",onclick:()=>{const yy=thisYear()-1; st.periodStart=yy+"-10-01"; st.periodEnd=yy+"-12-31"; render();}},"Last Q4")
+  );
+  const yearFields = el("div",{style:"display:flex;gap:8px;align-items:flex-end"},
+    field("Tax year", el("input",{type:"number",value:st.year,style:"width:100px",oninput:e=>{st.year=+e.target.value||thisYear(); render();}})),
+    field("As of", (()=>{const s=el("select",{onchange:e=>{st.asOfMode=e.target.value; customDateField.style.display=(st.asOfMode==="custom")?"block":"none"; render();}});
+      [["ytd","YTD through today"],["eoy","End of tax year"],["custom","Custom date"],["full","Full year (ignore as-of)"]]
+      .forEach(([v,l])=>s.appendChild(el("option",{value:v},l))); s.value=st.asOfMode; return s;})())
+  );
   const customDateField = field("Custom date", el("input",{type:"date",value:st.customDate,oninput:e=>{st.customDate=e.target.value; render();}}));
-  customDateField.style.display = (st.asOfMode==="custom") ? "block":"none";
+  customDateField.style.display = "none";
+  yearFields.appendChild(customDateField);
 
   const bar = el("div",{class:"card"},
     el("div",{class:"bd"},
-      el("div",{class:"row-bar"},
+      el("div",{style:"display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end"},
         field("Report", (()=>{const s=el("select",{onchange:e=>{st.type=e.target.value; render();}});
-          [["rollforward","Asset Roll-forward"],
-           ["schedule","Depreciation schedule (by asset)"],
-           ["disposals","Disposal report"],
-           ["form4797","Form 4797 — Sales of business property"],
-           ["form4562","Form 4562 — Depreciation & §179"],
-           ["inventory","Current inventory"],
-           ["by_entity","Summary by entity"],
-           ["by_category","Summary by category"]]
+          [["rollforward","Asset roll-forward"],["schedule","Depreciation schedule"],["disposals","Disposal report"],["inventory","Current inventory"],["by_entity","Summary by entity"],["by_category","Summary by category"]]
           .forEach(([v,l])=>s.appendChild(el("option",{value:v},l))); s.value=st.type; return s;})()),
-        field("Tax year", el("input",{type:"number",value:st.year,style:"width:100px",oninput:e=>{st.year=+e.target.value||thisYear(); render();}})),
-        field("As of", (()=>{const s=el("select",{onchange:e=>{st.asOfMode=e.target.value; customDateField.style.display=(st.asOfMode==="custom")?"block":"none"; render();}});
-          [["ytd","YTD through today"],["eoy","End of tax year"],["custom","Custom date"],["full","Full year (ignore as-of)"]]
-          .forEach(([v,l])=>s.appendChild(el("option",{value:v},l))); s.value=st.asOfMode; return s;})()),
-        customDateField,
+        field("Date mode", (()=>{const s=el("select",{onchange:e=>{st.dateMode=e.target.value; periodFields.style.display=(st.dateMode==="period")?"flex":"none"; yearFields.style.display=(st.dateMode==="year")?"flex":"none"; render();}});
+          [["year","Tax year"],["period","Custom period"]].forEach(([v,l])=>s.appendChild(el("option",{value:v},l))); s.value=st.dateMode; return s;})()),
+        field("Group by", (()=>{const s=el("select",{onchange:e=>{st.groupBy=e.target.value; render();}});
+          [["entity_category","Entity → Category"],["entity","Entity"],["none","None (flat)"]].forEach(([v,l])=>s.appendChild(el("option",{value:v},l))); s.value=st.groupBy; return s;})()),
+        yearFields, periodFields,
+        field("Monthly breakdown", (()=>{const c=el("input",{type:"checkbox"}); c.checked=st.showMonthly; c.onchange=()=>{st.showMonthly=c.checked; render();}; return c;})()),
         el("button",{class:"btn",onclick:()=>downloadCurrent()},"Download CSV")
       )
     )
   );
+  periodFields.style.display = "none";
 
   root.appendChild(bar);
 
@@ -1698,11 +2009,10 @@ VIEWS.reports = function(root) {
   function render() {
     out.innerHTML = "";
     const asOf = asOfDate();
+    const periodCtx = st.dateMode === "period" ? { start: st.periodStart, end: st.periodEnd } : null;
     if (st.type === "rollforward")      out.appendChild(renderRollforward(st.year, r=>lastCsv=r));
-    else if (st.type === "schedule")    out.appendChild(renderScheduleReport(st.year, r=>lastCsv=r, asOf));
-    else if (st.type === "disposals")   out.appendChild(renderDisposalReport(st.year, r=>lastCsv=r));
-    else if (st.type === "form4797")    out.appendChild(renderForm4797(st.year, r=>lastCsv=r));
-    else if (st.type === "form4562")    out.appendChild(renderForm4562(st.year, r=>lastCsv=r));
+    else if (st.type === "schedule")    out.appendChild(renderScheduleReport({year:st.year, period:periodCtx, groupBy:st.groupBy, showMonthly:st.showMonthly}, r=>lastCsv=r, asOf));
+    else if (st.type === "disposals")   out.appendChild(renderDisposalReport({year:st.year, period:periodCtx, groupBy:st.groupBy}, r=>lastCsv=r));
     else if (st.type === "inventory")   out.appendChild(renderInventoryReport(r=>lastCsv=r));
     else if (st.type === "by_entity")   out.appendChild(renderSummaryByEntity(st.year, r=>lastCsv=r));
     else if (st.type === "by_category") out.appendChild(renderSummaryByCategory(st.year, r=>lastCsv=r));
@@ -1789,360 +2099,315 @@ function renderRollforward(year, setCsv) {
     {label:"−Disp. accum.",class:"num"},{label:"=Close accum.",class:"num"},{label:"Close NBV",class:"num"}], rows));
 }
 
-function renderScheduleReport(year, setCsv, asOf) {
-  const list = STATE.assets.filter(a => new Date(a.in_service_date).getFullYear() <= year);
-  const headers = ["Asset","Entity","Category","In service","Cost","Prior accum.",year+" dep.","End accum.","End NBV","Status"];
-  const rows = [];
-  const T = { cost:0, pr:0, d:0, end:0, nbv:0 };
+function renderScheduleReport(opts, setCsv, asOf) {
+  // opts: { year, period?: {start,end}, groupBy: 'none'|'entity'|'entity_category', showMonthly: bool }
+  const { year, period, groupBy, showMonthly } = opts;
+  const mode = period ? "period" : "year";
+  // Filter: assets placed in service on/before end of window
+  const windowEndY = period ? new Date(period.end).getUTCFullYear() : year;
+  const list = STATE.assets.filter(a => new Date(a.in_service_date).getUTCFullYear() <= windowEndY);
   list.sort((a,b)=>new Date(a.in_service_date) - new Date(b.in_service_date));
-  list.forEach(a => {
-    const c = byId(STATE.categories,a.category_id); const e = byId(STATE.entities,a.entity_id);
+
+  // Per-asset compute
+  function compute(a) {
+    if (mode === "period") {
+      const r = assetPeriodDep(a, period.start, period.end);
+      return { cost:+a.cost||0, prior:r.priorAccum, expense:r.periodExpense, end:r.endAccum, nbv:r.endNBV, monthly:r.monthly };
+    }
     const disp = STATE.disposals.find(d=>d.asset_id===a.id);
-    const effective = (disp && new Date(disp.disposal_date).getFullYear()===year)
+    const effective = (disp && !disp.is_partial && new Date(disp.disposal_date).getUTCFullYear()===year)
       ? Object.assign({}, a, { disposal_date: disp.disposal_date }) : a;
     const rs = Depreciation.schedule(effective, year, asOf);
     const pr = (Depreciation.schedule(a, year-1).slice(-1)[0]||{}).accumulated || 0;
     const cur = rs.find(r=>r.year===year) || (rs.length? rs[rs.length-1] : null);
-    const y = cur ? cur.total_expense : 0;
+    const yExp = cur ? cur.total_expense : 0;
     const end = cur ? cur.accumulated : pr;
-    const nbv = (+a.cost||0) - end;
-    rows.push([a.description + (a.asset_number?" ("+a.asset_number+")":""), e?e.name:"—", c?c.name:"—",
-      fmtDate(a.in_service_date), {class:"num",value:fmt$(a.cost)},
-      {class:"num",value:fmt$(pr)},{class:"num",value:fmt$(y)},
-      {class:"num",value:fmt$(end)},{class:"num",value:fmt$(nbv)},
-      el("span",{class:"chip "+(a.status==="active"?"ok":a.status==="disposed"?"err":"warn")}, a.status)
-    ]);
-    T.cost+=+a.cost||0; T.pr+=pr; T.d+=y; T.end+=end; T.nbv+=nbv;
+    return { cost:+a.cost||0, prior:pr, expense:yExp, end, nbv:(+a.cost||0)-end, monthly:null };
+  }
+
+  // Column set (base + optional monthly columns)
+  const expenseLabel = mode==="period"
+    ? ("Dep. " + period.start + " → " + period.end)
+    : (year + " dep.");
+  const monthKeys = [];
+  if (showMonthly) {
+    if (mode === "period") {
+      // enumerate months between period.start and period.end
+      const s = new Date(period.start+"T00:00:00Z"), e = new Date(period.end+"T00:00:00Z");
+      let cur = new Date(Date.UTC(s.getUTCFullYear(), s.getUTCMonth(), 1));
+      while (cur <= e) {
+        monthKeys.push(cur.getUTCFullYear()+"-"+String(cur.getUTCMonth()+1).padStart(2,"0"));
+        cur = new Date(Date.UTC(cur.getUTCFullYear(), cur.getUTCMonth()+1, 1));
+      }
+    } else {
+      // Full year
+      for (let m=1; m<=12; m++) monthKeys.push(year+"-"+String(m).padStart(2,"0"));
+    }
+  }
+  const baseHeaders = ["Asset","In service","Cost","Prior accum.",expenseLabel];
+  const tailHeaders = ["End accum.","End NBV","Status"];
+  const headers = [...baseHeaders, ...monthKeys, ...tailHeaders];
+
+  // Grouping
+  function entityName(a) { return (byId(STATE.entities,a.entity_id)||{}).name || "Unassigned"; }
+  function categoryName(a) { return (byId(STATE.categories,a.category_id)||{}).name || "Uncategorized"; }
+
+  const groups = {}; // entity -> category -> [assets] OR entity -> [assets] OR "_" -> [assets]
+  list.forEach(a => {
+    if (groupBy === "none") {
+      (groups._ = groups._ || []).push(a);
+    } else if (groupBy === "entity") {
+      const k = entityName(a);
+      (groups[k] = groups[k] || []).push(a);
+    } else { // entity_category
+      const k1 = entityName(a), k2 = categoryName(a);
+      groups[k1] = groups[k1] || {};
+      (groups[k1][k2] = groups[k1][k2] || []).push(a);
+    }
   });
-  rows.push([el("b",{},"TOTAL"),"","","",{class:"num",value:el("b",{},fmt$(T.cost))},
-    {class:"num",value:el("b",{},fmt$(T.pr))},{class:"num",value:el("b",{},fmt$(T.d))},
-    {class:"num",value:el("b",{},fmt$(T.end))},{class:"num",value:el("b",{},fmt$(T.nbv))},""]);
-  setCsv({filename:"depreciation_schedule_"+year+".csv", headers, rows: rows.map(r=>r.map(c=>{
+
+  const rows = [];
+  const T = { cost:0, pr:0, d:0, end:0, nbv:0 };
+  const monthTotals = {}; monthKeys.forEach(k => monthTotals[k]=0);
+
+  function assetRow(a) {
+    const c = byId(STATE.categories,a.category_id);
+    const e = byId(STATE.entities,a.entity_id);
+    const r = compute(a);
+    T.cost+=r.cost; T.pr+=r.prior; T.d+=r.expense; T.end+=r.end; T.nbv+=r.nbv;
+    const monthCells = monthKeys.map(k => {
+      const v = (r.monthly && r.monthly[k]) || 0;
+      monthTotals[k] = (monthTotals[k]||0) + v;
+      return {class:"num",value:fmt$(v)};
+    });
+    return [
+      (groupBy==="none" ? (e?e.name+" · ":"")+(c?c.name+" · ":"") : "") + a.description + (a.asset_number?" ("+a.asset_number+")":""),
+      fmtDate(a.in_service_date),
+      {class:"num",value:fmt$(r.cost)},
+      {class:"num",value:fmt$(r.prior)},
+      {class:"num",value:fmt$(r.expense)},
+      ...monthCells,
+      {class:"num",value:fmt$(r.end)},
+      {class:"num",value:fmt$(r.nbv)},
+      el("span",{class:"chip "+(a.status==="active"?"ok":a.status==="disposed"?"err":"warn")}, a.status)
+    ];
+  }
+  function headerRow(label, level=1) {
+    const bg = level===1 ? "#eee5d8" : "#f2ece2";
+    const cell = el("td",{colspan:String(headers.length),style:"background:"+bg+";font-weight:700;padding:4px 8px;border-top:1px solid var(--border)"}, label);
+    return [cell];
+  }
+  function subtotalRow(label, S, mTot) {
+    const monthCells = monthKeys.map(k => ({class:"num",value:el("b",{},fmt$(mTot[k]||0))}));
+    return [
+      el("b",{style:"padding-left:12px"},"  ↳ "+label),
+      "", {class:"num",value:el("b",{},fmt$(S.cost))},
+      {class:"num",value:el("b",{},fmt$(S.pr))},
+      {class:"num",value:el("b",{},fmt$(S.d))},
+      ...monthCells,
+      {class:"num",value:el("b",{},fmt$(S.end))},
+      {class:"num",value:el("b",{},fmt$(S.nbv))},
+      ""
+    ];
+  }
+
+  if (groupBy === "none") {
+    (groups._ || []).forEach(a => rows.push(assetRow(a)));
+  } else if (groupBy === "entity") {
+    Object.keys(groups).sort().forEach(ename => {
+      rows.push(headerRow("Entity: " + ename, 1));
+      const eTot = { cost:0, pr:0, d:0, end:0, nbv:0 };
+      const mTot = {}; monthKeys.forEach(k => mTot[k]=0);
+      groups[ename].forEach(a => {
+        const before = { cost:T.cost, pr:T.pr, d:T.d, end:T.end, nbv:T.nbv, m:{} };
+        monthKeys.forEach(k => before.m[k] = monthTotals[k]||0);
+        rows.push(assetRow(a));
+        eTot.cost+=T.cost-before.cost; eTot.pr+=T.pr-before.pr; eTot.d+=T.d-before.d; eTot.end+=T.end-before.end; eTot.nbv+=T.nbv-before.nbv;
+        monthKeys.forEach(k => mTot[k] += (monthTotals[k]||0) - (before.m[k]||0));
+      });
+      rows.push(subtotalRow("Entity "+ename+" subtotal", eTot, mTot));
+    });
+  } else { // entity_category
+    Object.keys(groups).sort().forEach(ename => {
+      rows.push(headerRow("Entity: " + ename, 1));
+      const eTot = { cost:0, pr:0, d:0, end:0, nbv:0 };
+      const emTot = {}; monthKeys.forEach(k => emTot[k]=0);
+      const cats = groups[ename];
+      Object.keys(cats).sort().forEach(cname => {
+        rows.push(headerRow("  " + cname, 2));
+        const cTot = { cost:0, pr:0, d:0, end:0, nbv:0 };
+        const cmTot = {}; monthKeys.forEach(k => cmTot[k]=0);
+        cats[cname].forEach(a => {
+          const before = { cost:T.cost, pr:T.pr, d:T.d, end:T.end, nbv:T.nbv, m:{} };
+          monthKeys.forEach(k => before.m[k] = monthTotals[k]||0);
+          rows.push(assetRow(a));
+          cTot.cost+=T.cost-before.cost; cTot.pr+=T.pr-before.pr; cTot.d+=T.d-before.d; cTot.end+=T.end-before.end; cTot.nbv+=T.nbv-before.nbv;
+          monthKeys.forEach(k => cmTot[k] += (monthTotals[k]||0) - (before.m[k]||0));
+        });
+        rows.push(subtotalRow(cname+" subtotal", cTot, cmTot));
+        eTot.cost+=cTot.cost; eTot.pr+=cTot.pr; eTot.d+=cTot.d; eTot.end+=cTot.end; eTot.nbv+=cTot.nbv;
+        monthKeys.forEach(k => emTot[k] += cmTot[k]);
+      });
+      rows.push(subtotalRow("Entity "+ename+" subtotal", eTot, emTot));
+    });
+  }
+
+  // Grand total
+  {
+    const mCells = monthKeys.map(k => ({class:"num",value:el("b",{},fmt$(monthTotals[k]||0))}));
+    rows.push([el("b",{},"GRAND TOTAL"),"",{class:"num",value:el("b",{},fmt$(T.cost))},
+      {class:"num",value:el("b",{},fmt$(T.pr))},{class:"num",value:el("b",{},fmt$(T.d))},
+      ...mCells,
+      {class:"num",value:el("b",{},fmt$(T.end))},{class:"num",value:el("b",{},fmt$(T.nbv))},""]);
+  }
+
+  const filename = mode === "period"
+    ? "depreciation_schedule_"+period.start+"_to_"+period.end+".csv"
+    : "depreciation_schedule_"+year+".csv";
+  setCsv({filename, headers, rows: rows.map(r=>r.map(c=>{
     if (c && typeof c==="object") {
       if (c.nodeType) return c.textContent;
       if (c.value && c.value.nodeType) return c.value.textContent;
       if (c.value!=null) return c.value.toString().replace(/[$,]/g,"");
     } return c; }))});
-  return card("Depreciation schedule — "+year, tableEl(headers.map((h,i)=>i>=4&&i<=8?{label:h,class:"num"}:h), rows));
+
+  const title = mode==="period"
+    ? "Depreciation schedule — "+period.start+" to "+period.end
+    : "Depreciation schedule — "+year;
+  const headerDefs = headers.map((h,i)=>{
+    if (i===0 || i===1) return h;
+    if (i===headers.length-1) return h; // status
+    return {label:h, class:"num"};
+  });
+  return card(title, tableEl(headerDefs, rows));
 }
 
-function renderDisposalReport(year, setCsv) {
-  const list = STATE.disposals.filter(d => new Date(d.disposal_date).getFullYear() === year);
-  const headers = ["Date","Asset","Entity (at disposal)","Type","Cost","Accumulated","NBV","Proceeds","Gain/(Loss)","Buyer","Notes"];
-  const rows = [];
-  let T = {cost:0,acc:0,nbv:0,p:0,gl:0};
+function renderDisposalReport(opts, setCsv) {
+  // opts: { year, period?: {start,end}, groupBy }
+  const { year, period, groupBy } = opts;
+  const mode = period ? "period" : "year";
+  // Filter disposals in window
+  const list = STATE.disposals.filter(d => {
+    if (!d.disposal_date) return false;
+    if (mode === "period") return d.disposal_date >= period.start && d.disposal_date <= period.end;
+    return new Date(d.disposal_date).getUTCFullYear() === year;
+  }).sort((a,b)=>new Date(a.disposal_date) - new Date(b.disposal_date));
+
+  const headers = ["Date","Asset","Type","Cost/Retired","Accum.","NBV","Proceeds/FMV","Gain/(Loss)","Buyer","Notes"];
+
+  function entityName(a) { return a ? ((byId(STATE.entities,a.entity_id)||{}).name || "Unassigned") : "(deleted)"; }
+  function categoryName(a) { return a ? ((byId(STATE.categories,a.category_id)||{}).name || "Uncategorized") : "—"; }
+
+  const groups = {};
   list.forEach(d => {
     const a = byId(STATE.assets, d.asset_id);
-    if (!a) return;
-    const a2 = Object.assign({}, a, { disposal_date: d.disposal_date });
-    const rs = Depreciation.schedule(a2);
-    const last = rs[rs.length-1];
-    const acc = last ? last.accumulated : 0;
-    const nbv = (+a.cost||0) - acc;
-    const gl = (+d.proceeds||0) - nbv;
-    const e = byId(STATE.entities, a.entity_id);
-    rows.push([fmtDate(d.disposal_date), a.description, e?e.name:"", d.disposal_type||"",
-      {class:"num",value:fmt$(a.cost)},{class:"num",value:fmt$(acc)},{class:"num",value:fmt$(nbv)},
-      {class:"num",value:fmt$(d.proceeds||0)},{class:"num",value:fmt$(gl)}, d.buyer||"", d.notes||""]);
-    T.cost+=+a.cost||0; T.acc+=acc; T.nbv+=nbv; T.p+=+d.proceeds||0; T.gl+=gl;
+    const k1 = entityName(a);
+    const k2 = categoryName(a);
+    if (groupBy === "none") {
+      (groups._ = groups._ || []).push({d,a});
+    } else if (groupBy === "entity") {
+      (groups[k1] = groups[k1] || []).push({d,a});
+    } else {
+      groups[k1] = groups[k1] || {};
+      (groups[k1][k2] = groups[k1][k2] || []).push({d,a});
+    }
   });
-  rows.push(["","","TOTAL","",{class:"num",value:el("b",{},fmt$(T.cost))},{class:"num",value:el("b",{},fmt$(T.acc))},
+
+  function rowFor({d,a}) {
+    let cost, acc, nbv, considered, gl;
+    if (d.cost_retired != null) {
+      cost = +d.cost_retired;
+      acc  = +d.accum_dep_retired || 0;
+      nbv  = +d.nbv_retired || 0;
+    } else if (a) {
+      const rs = Depreciation.schedule(Object.assign({}, a, { disposal_date: d.disposal_date }));
+      const last = rs[rs.length-1]; acc = last ? last.accumulated : 0;
+      cost = +a.cost||0; nbv = cost - acc;
+    } else { cost=acc=nbv=0; }
+    considered = d.disposal_type === "donated" ? (+d.fmv||0) : (+d.proceeds||0);
+    gl = considered - nbv;
+    const typeLabel = (d.disposal_type||"") + (d.is_partial ? " ("+(d.ownership_pct_sold||0)+"%)" : "");
+    const proceedsShown = d.disposal_type === "donated"
+      ? "FMV "+fmt$(d.fmv||0)+(d.proceeds?" + $"+(+d.proceeds||0):"")
+      : fmt$(d.proceeds||0);
+    return { row: [fmtDate(d.disposal_date), a?a.description:"(deleted)", typeLabel,
+      {class:"num",value:fmt$(cost)},{class:"num",value:fmt$(acc)},{class:"num",value:fmt$(nbv)},
+      {class:"num",value:proceedsShown},{class:"num",value:fmt$(gl)}, d.buyer||"", d.notes||""],
+      cost, acc, nbv, p: considered, gl
+    };
+  }
+
+  const rows = [];
+  const T = {cost:0,acc:0,nbv:0,p:0,gl:0};
+  function headerRow(label, level=1) {
+    const bg = level===1 ? "#eee5d8" : "#f2ece2";
+    return [ el("td",{colspan:String(headers.length),style:"background:"+bg+";font-weight:700;padding:4px 8px;border-top:1px solid var(--border)"}, label) ];
+  }
+  function subtotalRow(label, S) {
+    return ["", el("b",{},"  ↳ "+label), "",
+      {class:"num",value:el("b",{},fmt$(S.cost))},{class:"num",value:el("b",{},fmt$(S.acc))},
+      {class:"num",value:el("b",{},fmt$(S.nbv))},{class:"num",value:el("b",{},fmt$(S.p))},
+      {class:"num",value:el("b",{},fmt$(S.gl))},"",""];
+  }
+
+  if (groupBy === "none") {
+    (groups._ || []).forEach(item => {
+      const r = rowFor(item);
+      rows.push(r.row);
+      T.cost+=r.cost; T.acc+=r.acc; T.nbv+=r.nbv; T.p+=r.p; T.gl+=r.gl;
+    });
+  } else if (groupBy === "entity") {
+    Object.keys(groups).sort().forEach(ename => {
+      rows.push(headerRow("Entity: "+ename, 1));
+      const S = {cost:0,acc:0,nbv:0,p:0,gl:0};
+      groups[ename].forEach(item => {
+        const r = rowFor(item); rows.push(r.row);
+        S.cost+=r.cost; S.acc+=r.acc; S.nbv+=r.nbv; S.p+=r.p; S.gl+=r.gl;
+      });
+      rows.push(subtotalRow("Entity "+ename+" subtotal", S));
+      T.cost+=S.cost; T.acc+=S.acc; T.nbv+=S.nbv; T.p+=S.p; T.gl+=S.gl;
+    });
+  } else { // entity_category
+    Object.keys(groups).sort().forEach(ename => {
+      rows.push(headerRow("Entity: "+ename, 1));
+      const eS = {cost:0,acc:0,nbv:0,p:0,gl:0};
+      const cats = groups[ename];
+      Object.keys(cats).sort().forEach(cname => {
+        rows.push(headerRow("  "+cname, 2));
+        const cS = {cost:0,acc:0,nbv:0,p:0,gl:0};
+        cats[cname].forEach(item => {
+          const r = rowFor(item); rows.push(r.row);
+          cS.cost+=r.cost; cS.acc+=r.acc; cS.nbv+=r.nbv; cS.p+=r.p; cS.gl+=r.gl;
+        });
+        rows.push(subtotalRow(cname+" subtotal", cS));
+        eS.cost+=cS.cost; eS.acc+=cS.acc; eS.nbv+=cS.nbv; eS.p+=cS.p; eS.gl+=cS.gl;
+      });
+      rows.push(subtotalRow("Entity "+ename+" subtotal", eS));
+      T.cost+=eS.cost; T.acc+=eS.acc; T.nbv+=eS.nbv; T.p+=eS.p; T.gl+=eS.gl;
+    });
+  }
+
+  rows.push(["","",el("b",{},"GRAND TOTAL"),
+    {class:"num",value:el("b",{},fmt$(T.cost))},{class:"num",value:el("b",{},fmt$(T.acc))},
     {class:"num",value:el("b",{},fmt$(T.nbv))},{class:"num",value:el("b",{},fmt$(T.p))},
     {class:"num",value:el("b",{},fmt$(T.gl))},"",""]);
-  setCsv({filename:"disposals_"+year+".csv", headers, rows: rows.map(r=>r.map(c=>{
+
+  const filename = mode==="period"
+    ? "disposals_"+period.start+"_to_"+period.end+".csv"
+    : "disposals_"+year+".csv";
+  setCsv({filename, headers, rows: rows.map(r=>r.map(c=>{
     if (c && typeof c==="object") {
       if (c.nodeType) return c.textContent;
       if (c.value && c.value.nodeType) return c.value.textContent;
       if (c.value!=null) return c.value.toString().replace(/[$,]/g,"");
     } return c; }))});
-  return card("Disposal report — "+year, tableEl(headers.map((h,i)=>[4,5,6,7,8].includes(i)?{label:h,class:"num"}:h), rows));
+
+  const title = mode==="period"
+    ? "Disposal report — "+period.start+" to "+period.end
+    : "Disposal report — "+year;
+  const headerDefs = headers.map((h,i)=>[3,4,5,6,7].includes(i)?{label:h,class:"num"}:h);
+  return card(title, tableEl(headerDefs, rows));
 }
-
-// ---------- Form 4797: Sales of Business Property ----------
-// For each asset disposed in `year`, computes §1245 ordinary recapture and the
-// remaining §1231 gain (long-term capital). §1250 real property currently
-// reports 0 ordinary recapture (most post-1986 SL-depreciated property has no
-// "additional depreciation"); the CPA can flag exceptions per asset.
-function renderForm4797(year, setCsv) {
-  const list = STATE.disposals
-    .filter(d => new Date(d.disposal_date).getFullYear() === year)
-    .map(d => ({ d, a: byId(STATE.assets, d.asset_id) }))
-    .filter(x => x.a)
-    .sort((x,y) => new Date(x.d.disposal_date) - new Date(y.d.disposal_date));
-
-  const rows1245 = [], rows1250 = [], rowsOther = [];
-  const T = { proceeds:0, cost:0, accum:0, basis:0, gl:0, sec1245:0, sec1231:0 };
-
-  list.forEach(({d, a}) => {
-    const a2 = Object.assign({}, a, { disposal_date: d.disposal_date });
-    const sched = Depreciation.schedule(a2);
-    const last = sched[sched.length - 1];
-    const accum = last ? last.accumulated : 0;
-    const cost = +a.cost || 0;
-    const proceeds = +d.proceeds || 0;
-    const basis = cost - accum;
-    const gl = proceeds - basis;
-
-    const ptype = effectivePropertyType(a);
-    let sec1245 = 0, sec1231 = 0;
-    if (gl <= 0) {
-      // Loss: all §1231
-      sec1231 = gl;
-    } else if (ptype === "1245") {
-      sec1245 = Math.min(gl, accum);
-      sec1231 = gl - sec1245;
-    } else if (ptype === "1250") {
-      // Simplification: post-1986 SL real property → no additional depreciation.
-      sec1245 = 0;
-      sec1231 = gl;
-    } else {
-      // 'none' — treat as full §1231 gain.
-      sec1231 = gl;
-    }
-
-    const e = byId(STATE.entities, a.entity_id);
-    const row = {
-      desc: a.description + (a.asset_number ? " ("+a.asset_number+")" : ""),
-      acq: fmtDate(a.in_service_date),
-      sold: fmtDate(d.disposal_date),
-      proceeds, cost, accum, basis, gl, sec1245, sec1231,
-      ptype: PROP_TYPE_LABELS[ptype] || ptype,
-      entity: e ? e.name : "—",
-    };
-    (ptype === "1245" ? rows1245 : ptype === "1250" ? rows1250 : rowsOther).push(row);
-    T.proceeds+=proceeds; T.cost+=cost; T.accum+=accum; T.basis+=basis;
-    T.gl+=gl; T.sec1245+=sec1245; T.sec1231+=sec1231;
-  });
-
-  const headers = ["Description","Date acquired","Date sold","Property type","Entity",
-    "Proceeds","Cost basis","Accum. dep.","Tax basis","Total gain/(loss)",
-    "§1245 ordinary","§1231 gain"];
-
-  const csvRows = [];
-  const sections = [];
-
-  function buildSection(title, rows) {
-    if (!rows.length) return null;
-    const sub = { proceeds:0, cost:0, accum:0, basis:0, gl:0, sec1245:0, sec1231:0 };
-    const rowEls = rows.map(r => {
-      sub.proceeds+=r.proceeds; sub.cost+=r.cost; sub.accum+=r.accum;
-      sub.basis+=r.basis; sub.gl+=r.gl; sub.sec1245+=r.sec1245; sub.sec1231+=r.sec1231;
-      csvRows.push([r.desc, r.acq, r.sold, r.ptype, r.entity,
-        r.proceeds.toFixed(2), r.cost.toFixed(2), r.accum.toFixed(2), r.basis.toFixed(2),
-        r.gl.toFixed(2), r.sec1245.toFixed(2), r.sec1231.toFixed(2)]);
-      return [r.desc, r.acq, r.sold, r.ptype, r.entity,
-        {class:"num",value:fmt$(r.proceeds)},{class:"num",value:fmt$(r.cost)},
-        {class:"num",value:fmt$(r.accum)},{class:"num",value:fmt$(r.basis)},
-        {class:"num",value:fmt$(r.gl)},
-        {class:"num",value:fmt$(r.sec1245)},{class:"num",value:fmt$(r.sec1231)}];
-    });
-    rowEls.push([el("b",{},"Subtotal — "+title), "","","","",
-      {class:"num",value:el("b",{},fmt$(sub.proceeds))},{class:"num",value:el("b",{},fmt$(sub.cost))},
-      {class:"num",value:el("b",{},fmt$(sub.accum))},{class:"num",value:el("b",{},fmt$(sub.basis))},
-      {class:"num",value:el("b",{},fmt$(sub.gl))},
-      {class:"num",value:el("b",{},fmt$(sub.sec1245))},{class:"num",value:el("b",{},fmt$(sub.sec1231))}]);
-    csvRows.push(["Subtotal — "+title, "","","","",
-      sub.proceeds.toFixed(2), sub.cost.toFixed(2), sub.accum.toFixed(2), sub.basis.toFixed(2),
-      sub.gl.toFixed(2), sub.sec1245.toFixed(2), sub.sec1231.toFixed(2)]);
-    return card(title, tableEl(
-      headers.map((h,i)=>i>=5?{label:h,class:"num"}:h), rowEls));
-  }
-
-  const s1 = buildSection("§1245 — Personal property", rows1245);
-  const s2 = buildSection("§1250 — Real property", rows1250);
-  const s3 = buildSection("Other / non-recapture", rowsOther);
-
-  const summary = card("Form 4797 totals — "+year, tableEl(
-    ["", {label:"Proceeds",class:"num"},{label:"Cost basis",class:"num"},
-     {label:"Accum. dep.",class:"num"},{label:"Tax basis",class:"num"},
-     {label:"Total gain/(loss)",class:"num"},
-     {label:"§1245 ordinary (Part III)",class:"num"},
-     {label:"§1231 gain (Part I)",class:"num"}],
-    [["TOTAL",
-      {class:"num",value:fmt$(T.proceeds)},{class:"num",value:fmt$(T.cost)},
-      {class:"num",value:fmt$(T.accum)},{class:"num",value:fmt$(T.basis)},
-      {class:"num",value:fmt$(T.gl)},
-      {class:"num",value:fmt$(T.sec1245)},{class:"num",value:fmt$(T.sec1231)}]]
-  ));
-  csvRows.push([]);
-  csvRows.push(["TOTAL","","","","",
-    T.proceeds.toFixed(2), T.cost.toFixed(2), T.accum.toFixed(2), T.basis.toFixed(2),
-    T.gl.toFixed(2), T.sec1245.toFixed(2), T.sec1231.toFixed(2)]);
-
-  setCsv({filename:"form_4797_"+year+".csv", headers, rows: csvRows});
-
-  const wrap = el("div",{});
-  wrap.appendChild(summary);
-  if (!list.length) {
-    wrap.appendChild(card(null, el("p",{class:"small"},"No disposals in "+year+".")));
-  }
-  if (s1) wrap.appendChild(s1);
-  if (s2) wrap.appendChild(s2);
-  if (s3) wrap.appendChild(s3);
-  return wrap;
-}
-
-// ---------- Form 4562: Depreciation & Amortization ----------
-// Current-year acquisitions broken out by class life (3/5/7/10/15/20/25/27.5/39/Other),
-// plus a single line for "other depreciation" (assets in service before this year).
-// Includes total §179, total bonus, and grand-total expense, plus per-entity rollup.
-function renderForm4562(year, setCsv) {
-  const CLASS_LIVES = [3, 5, 7, 10, 15, 20, 25, 27.5, 39];
-  const classLifeBucket = (life) => {
-    const L = +life || 0;
-    for (const cl of CLASS_LIVES) if (Math.abs(L - cl) < 0.01) return String(cl);
-    return "Other";
-  };
-
-  // Active-or-disposed-in-year assets that have been placed in service on/before this year.
-  const list = STATE.assets
-    .filter(a => yearOfStr(a.in_service_date) <= year);
-
-  // Compute per-asset current-year numbers using the same disposal-aware logic
-  // the rest of the app uses.
-  const enriched = list.map(a => {
-    const disp = STATE.disposals.find(d => d.asset_id === a.id);
-    const dispThisYr = disp && yearOfStr(disp.disposal_date) === year;
-    const effective = dispThisYr ? Object.assign({}, a, { disposal_date: disp.disposal_date }) : a;
-    const sched = Depreciation.schedule(effective, year);
-    const yr = sched.find(r => r.year === year) || null;
-    return {
-      a, yr,
-      inYr: yearOfStr(a.in_service_date),
-      cost: +a.cost || 0,
-      sec179: yr ? yr.sec179 : 0,
-      bonus: yr ? yr.bonus : 0,
-      reg: yr ? yr.depreciation : 0,
-      total: yr ? yr.total_expense : 0,
-    };
-  });
-
-  const current = enriched.filter(x => x.inYr === year);
-  const prior = enriched.filter(x => x.inYr < year);
-
-  // ---- Section 1: current-year acquisitions, by class life ----
-  const buckets = {};
-  CLASS_LIVES.forEach(cl => buckets[String(cl)] = { count:0, cost:0, sec179:0, bonus:0, reg:0, total:0 });
-  buckets["Other"] = { count:0, cost:0, sec179:0, bonus:0, reg:0, total:0 };
-
-  current.forEach(x => {
-    const k = classLifeBucket(x.a.life_years);
-    const b = buckets[k];
-    b.count++; b.cost+=x.cost; b.sec179+=x.sec179; b.bonus+=x.bonus; b.reg+=x.reg; b.total+=x.total;
-  });
-
-  const headers1 = ["Class life","# Assets","Cost","§179","Bonus","Regular dep.","Total expense"];
-  const rows1 = [];
-  const t1 = { count:0, cost:0, sec179:0, bonus:0, reg:0, total:0 };
-  ["3","5","7","10","15","20","25","27.5","39","Other"].forEach(k => {
-    const b = buckets[k];
-    if (b.count === 0) return;
-    rows1.push([k+(k==="Other"?"":"-year"),
-      String(b.count),
-      {class:"num",value:fmt$(b.cost)},{class:"num",value:fmt$(b.sec179)},
-      {class:"num",value:fmt$(b.bonus)},{class:"num",value:fmt$(b.reg)},
-      {class:"num",value:fmt$(b.total)}]);
-    t1.count+=b.count; t1.cost+=b.cost; t1.sec179+=b.sec179;
-    t1.bonus+=b.bonus; t1.reg+=b.reg; t1.total+=b.total;
-  });
-  rows1.push([el("b",{},"Subtotal — current year"), el("b",{},String(t1.count)),
-    {class:"num",value:el("b",{},fmt$(t1.cost))},{class:"num",value:el("b",{},fmt$(t1.sec179))},
-    {class:"num",value:el("b",{},fmt$(t1.bonus))},{class:"num",value:el("b",{},fmt$(t1.reg))},
-    {class:"num",value:el("b",{},fmt$(t1.total))}]);
-
-  // ---- Section 2: prior-year assets (single "other depreciation" line) ----
-  const t2 = { count:0, cost:0, sec179:0, bonus:0, reg:0, total:0 };
-  prior.forEach(x => {
-    if (x.total === 0) return;
-    t2.count++; t2.cost+=x.cost; t2.sec179+=x.sec179;
-    t2.bonus+=x.bonus; t2.reg+=x.reg; t2.total+=x.total;
-  });
-  const rows2 = [["Other depreciation (prior-year assets, line 17)",
-    String(t2.count),
-    {class:"num",value:fmt$(t2.cost)},{class:"num",value:fmt$(t2.sec179)},
-    {class:"num",value:fmt$(t2.bonus)},{class:"num",value:fmt$(t2.reg)},
-    {class:"num",value:fmt$(t2.total)}]];
-
-  // ---- Section 3: per-entity rollup ----
-  const ents = {};
-  enriched.forEach(x => {
-    const eName = (byId(STATE.entities, x.a.entity_id)||{}).name || "Unassigned";
-    const e = ents[eName] = ents[eName] || { count:0, cost:0, sec179:0, bonus:0, reg:0, total:0 };
-    e.count++; e.cost+=x.cost; e.sec179+=x.sec179;
-    e.bonus+=x.bonus; e.reg+=x.reg; e.total+=x.total;
-  });
-  const headers3 = ["Entity","# Assets","Cost","§179","Bonus","Regular dep.","Total expense"];
-  const rows3 = [];
-  const t3 = { count:0, cost:0, sec179:0, bonus:0, reg:0, total:0 };
-  Object.keys(ents).sort().forEach(k => {
-    const b = ents[k];
-    rows3.push([k, String(b.count),
-      {class:"num",value:fmt$(b.cost)},{class:"num",value:fmt$(b.sec179)},
-      {class:"num",value:fmt$(b.bonus)},{class:"num",value:fmt$(b.reg)},
-      {class:"num",value:fmt$(b.total)}]);
-    t3.count+=b.count; t3.cost+=b.cost; t3.sec179+=b.sec179;
-    t3.bonus+=b.bonus; t3.reg+=b.reg; t3.total+=b.total;
-  });
-  rows3.push([el("b",{},"TOTAL"), el("b",{},String(t3.count)),
-    {class:"num",value:el("b",{},fmt$(t3.cost))},{class:"num",value:el("b",{},fmt$(t3.sec179))},
-    {class:"num",value:el("b",{},fmt$(t3.bonus))},{class:"num",value:el("b",{},fmt$(t3.reg))},
-    {class:"num",value:el("b",{},fmt$(t3.total))}]);
-
-  // ---- Grand summary card ----
-  const grand = { sec179: t1.sec179+t2.sec179, bonus: t1.bonus+t2.bonus,
-                  reg: t1.reg+t2.reg, total: t1.total+t2.total };
-  const summary = card("Form 4562 totals — "+year, tableEl(
-    [{label:"§179",class:"num"},{label:"Bonus depreciation",class:"num"},
-     {label:"Regular MACRS",class:"num"},{label:"Total expense",class:"num"}],
-    [[{class:"num",value:el("b",{},fmt$(grand.sec179))},
-      {class:"num",value:el("b",{},fmt$(grand.bonus))},
-      {class:"num",value:el("b",{},fmt$(grand.reg))},
-      {class:"num",value:el("b",{},fmt$(grand.total))}]]
-  ));
-
-  // ---- CSV ----
-  const csvHeaders = ["Section","Bucket","# Assets","Cost","§179","Bonus","Regular dep.","Total expense"];
-  const csvRows = [];
-  ["3","5","7","10","15","20","25","27.5","39","Other"].forEach(k => {
-    const b = buckets[k]; if (b.count === 0) return;
-    csvRows.push(["Current-year acquisitions", k+(k==="Other"?"":"-year"), b.count,
-      b.cost.toFixed(2), b.sec179.toFixed(2), b.bonus.toFixed(2),
-      b.reg.toFixed(2), b.total.toFixed(2)]);
-  });
-  csvRows.push(["Current-year acquisitions","Subtotal", t1.count,
-    t1.cost.toFixed(2), t1.sec179.toFixed(2), t1.bonus.toFixed(2), t1.reg.toFixed(2), t1.total.toFixed(2)]);
-  csvRows.push(["Prior-year assets","Other depreciation (line 17)", t2.count,
-    t2.cost.toFixed(2), t2.sec179.toFixed(2), t2.bonus.toFixed(2), t2.reg.toFixed(2), t2.total.toFixed(2)]);
-  csvRows.push([]);
-  csvRows.push(["By entity","",""]);
-  Object.keys(ents).sort().forEach(k => {
-    const b = ents[k];
-    csvRows.push(["By entity", k, b.count,
-      b.cost.toFixed(2), b.sec179.toFixed(2), b.bonus.toFixed(2), b.reg.toFixed(2), b.total.toFixed(2)]);
-  });
-  csvRows.push(["By entity","TOTAL", t3.count,
-    t3.cost.toFixed(2), t3.sec179.toFixed(2), t3.bonus.toFixed(2), t3.reg.toFixed(2), t3.total.toFixed(2)]);
-  csvRows.push([]);
-  csvRows.push(["Grand totals","",""]);
-  csvRows.push(["Grand totals","§179","",grand.sec179.toFixed(2)]);
-  csvRows.push(["Grand totals","Bonus","",grand.bonus.toFixed(2)]);
-  csvRows.push(["Grand totals","Regular MACRS","",grand.reg.toFixed(2)]);
-  csvRows.push(["Grand totals","Total expense","",grand.total.toFixed(2)]);
-  setCsv({filename:"form_4562_"+year+".csv", headers: csvHeaders, rows: csvRows});
-
-  const wrap = el("div",{});
-  wrap.appendChild(summary);
-  wrap.appendChild(card("Current-year acquisitions by class life — "+year,
-    tableEl(headers1.map((h,i)=>i>=2?{label:h,class:"num"}:h), rows1)));
-  wrap.appendChild(card("Prior-year assets (other depreciation) — "+year,
-    tableEl(headers1.map((h,i)=>i>=2?{label:h,class:"num"}:h), rows2)));
-  wrap.appendChild(card("By entity — "+year,
-    tableEl(headers3.map((h,i)=>i>=1?{label:h,class:"num"}:h), rows3)));
-  return wrap;
-}
-
-// Robust year-from-date helper for the Form 4562 report (UTC-safe).
-function yearOfStr(s) { return s ? new Date(s).getUTCFullYear() : 0; }
 
 function renderInventoryReport(setCsv) {
   const list = STATE.assets.filter(a => a.status === "active");
@@ -2434,6 +2699,744 @@ function downloadCSV(filename, headers, rows) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a"); a.href = url; a.download = filename; a.click();
   setTimeout(()=>URL.revokeObjectURL(url), 1000);
+}
+
+// ============================================================
+// Pool helpers (Recip Mares / Trading)
+// ============================================================
+
+// Format a horse's display label: "22 b f (Sire x Dam)" — year (2-digit), color, sex, pedigree.
+function horseDisplayName(a) {
+  if (!a) return "";
+  const yr = a.foaling_year ? String(a.foaling_year).slice(-2) : "";
+  const color = a.color ? String(a.color).trim().slice(0,3).toLowerCase() : ""; // 'bay'->'bay', 'chestnut'->'che'
+  const colorShort = ({bay:"b",chestnut:"ch",gray:"gr",grey:"gr",black:"bl",palomino:"pal",buckskin:"bs",roan:"rn",dun:"dn"})[ (a.color||"").toLowerCase() ] || color;
+  const sex = (a.sex||"").toLowerCase();
+  const pedigree = (a.sire || a.dam) ? " ("+(a.sire||"?")+" x "+(a.dam||"?")+")" : "";
+  const parts = [yr, colorShort, sex].filter(Boolean).join(" ");
+  return parts + pedigree;
+}
+
+// Pool summary row for KPI cards
+function poolSummary(items) {
+  const y = thisYear();
+  const active = items.filter(a => a.status === "active");
+  const inv = active.filter(a => a.is_inventory);
+  const dep = active.filter(a => !a.is_inventory);
+  const totCost = active.reduce((s,a)=>s+(+a.cost||0),0);
+  const depTot = Depreciation.yearTotals(dep, y);
+  const invCost = inv.reduce((s,a)=>s+(+a.cost||0),0);
+  return {
+    count: active.length,
+    depCount: dep.length,
+    invCount: inv.length,
+    totCost,
+    invCost,
+    depCost: depTot.cost,
+    nbv: depTot.nbv,
+    accum: depTot.accumulated,
+    thisYearDep: depTot.depreciation,
+  };
+}
+
+// Shared roster renderer for pool views
+function renderPoolRoster(root, opts) {
+  const { poolType, title, bucketFilter, showBucket, showPedigree, showOwnership, addLabel } = opts;
+  const pool = STATE.assets.filter(a => a.pool_type === poolType);
+  const state = { q:"", bucket: bucketFilter||"", status:"active" };
+
+  const header = el("div",{style:"display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px"},
+    el("h2",{},title, " ", el("small",{},pool.length+" on file")),
+    el("div",{style:"display:flex;gap:6px;flex-wrap:wrap"},
+      el("button",{class:"btn", onclick:()=>{
+        // Use the generic asset modal with pool_type pre-set via ctx hack.
+        // Simpler: open asset modal and set pool_type on the object before render.
+        openPoolAssetModal(null, poolType);
+      }}, "+ "+addLabel),
+      el("button",{class:"btn ghost", onclick:()=>openPoolImportModal(poolType)}, "Import CSV"),
+      el("button",{class:"btn ghost", onclick:()=>exportPoolCSV(poolType)}, "Export CSV"),
+    )
+  );
+  root.appendChild(header);
+
+  // Summary KPIs
+  const sum = poolSummary(pool);
+  const kpiRow = el("div",{class:"grid cols-4", style:"margin-bottom:10px"},
+    kpi("Active count", String(sum.count), sum.invCount?sum.invCount+" inventory":""),
+    kpi("Total cost basis", fmt$(sum.totCost), sum.invCost?fmt$(sum.invCost)+" inventory":""),
+    kpi("Accumulated dep.", fmt$(sum.accum), "Depreciable only"),
+    kpi("Net book value", fmt$(sum.nbv + sum.invCost), "Depreciable NBV + inventory cost")
+  );
+  root.appendChild(kpiRow);
+
+  // Filters
+  const filterBar = el("div",{style:"display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap"});
+  filterBar.appendChild(el("input",{type:"search",placeholder:"Search name / mare # / sire / dam...",style:"min-width:260px",
+    oninput:e=>{ state.q=e.target.value.toLowerCase(); render(); }}));
+  if (showBucket) {
+    const bsel = el("select",{onchange:e=>{ state.bucket=e.target.value; render(); }});
+    bsel.appendChild(el("option",{value:""},"All buckets"));
+    ["Solo Horses","Graves Purchase","Repro","Solo - Post Cutover"].forEach(b=>bsel.appendChild(el("option",{value:b},b)));
+    bsel.value = state.bucket||"";
+    filterBar.appendChild(bsel);
+  }
+  const ssel = el("select",{onchange:e=>{ state.status=e.target.value; render(); }});
+  [["active","Active only"],["disposed","Disposed only"],["","All"]].forEach(([v,l])=>ssel.appendChild(el("option",{value:v},l)));
+  ssel.value = state.status;
+  filterBar.appendChild(ssel);
+  root.appendChild(filterBar);
+
+  const tableHost = el("div",{});
+  root.appendChild(tableHost);
+
+  function render() {
+    tableHost.innerHTML = "";
+    const y = thisYear();
+    const filtered = pool.filter(a => {
+      if (state.status && a.status !== state.status) return false;
+      if (showBucket && state.bucket && a.bucket_tag !== state.bucket) return false;
+      if (state.q) {
+        const hay = [a.description, a.asset_number, a.sire, a.dam, a.bucket_tag, a.color].filter(Boolean).join(" ").toLowerCase();
+        if (!hay.includes(state.q)) return false;
+      }
+      return true;
+    });
+    const headers = ["#"];
+    if (showBucket) headers.push("Bucket");
+    headers.push("Description");
+    if (showPedigree) headers.push("Horse");
+    headers.push("In-service","Cost");
+    if (showOwnership) headers.push("Solo %");
+    headers.push("Accum.","NBV","Status","");
+    const rows = filtered.map(a => {
+      const sched = a.is_inventory ? [] : Depreciation.schedule(a, y);
+      const last = sched[sched.length-1];
+      const acc = last ? last.accumulated : 0;
+      const nbv = (+a.cost||0) - acc;
+      const r = [a.asset_number || ""];
+      if (showBucket) r.push(a.bucket_tag || "—");
+      r.push(el("a",{href:"#",onclick:e=>{e.preventDefault(); show("asset",{id:a.id});}}, a.description || "(no name)"));
+      if (showPedigree) r.push(el("span",{style:"font-family:monospace;font-size:12px"}, horseDisplayName(a) || "—"));
+      r.push(fmtDate(a.in_service_date));
+      r.push({class:"num", value: fmt$(a.cost)});
+      if (showOwnership) r.push((a.ownership_pct==null?100:a.ownership_pct)+"%");
+      r.push({class:"num", value: fmt$(acc)});
+      r.push({class:"num", value: fmt$(nbv)});
+      r.push(el("span",{class:"chip "+(a.status==="active"?"ok":a.status==="disposed"?"err":"warn")}, a.is_inventory ? "inv" : a.status));
+      r.push(el("div",{style:"display:flex;gap:4px"},
+        el("button",{class:"btn ghost sm",onclick:()=>openPoolAssetModal(a.id, poolType)},"Edit"),
+        a.status==="active" && el("button",{class:"btn ghost sm",onclick:()=>openDisposalModal(a.id)},"Dispose")
+      ));
+      return r;
+    });
+    tableHost.appendChild(tableEl(headers, rows, {empty:"No "+title.toLowerCase()+" match."}));
+  }
+  render();
+}
+
+// Opens the regular asset modal with pool_type pre-set (for new records)
+function openPoolAssetModal(id, poolType) {
+  if (id) { openAssetModal(id); return; }
+  // Create a stub asset with pool_type set, then open the modal.
+  // Trick: push a temporary default into STATE so openAssetModal sees it — simpler to monkey-patch:
+  // We'll just call openAssetModal(null) and it uses defaults; but pool_type needs to be set.
+  // Easiest: open the modal, then set the pool select programmatically after DOM ready.
+  openAssetModal(null);
+  setTimeout(() => {
+    // Find the pool select in the rendered modal and set it
+    const sels = document.querySelectorAll("#modalHost select");
+    for (const s of sels) {
+      // The pool select has option values "", "recip_mare", "trading"
+      if (s.querySelector('option[value="recip_mare"]') && s.querySelector('option[value="trading"]')) {
+        s.value = poolType;
+        s.dispatchEvent(new Event("change"));
+        break;
+      }
+    }
+  }, 60);
+}
+
+VIEWS.recip_mares = function(root) {
+  renderPoolRoster(root, {
+    poolType: "recip_mare",
+    title: "Recip Mares",
+    showBucket: true,
+    showPedigree: false,
+    showOwnership: false,
+    addLabel: "Add Recip Mare"
+  });
+  // Bucket subtotal table
+  const items = STATE.assets.filter(a=>a.pool_type==="recip_mare" && a.status==="active");
+  const byBucket = {};
+  items.forEach(a => {
+    const key = a.bucket_tag || "(unlabeled)";
+    if (!byBucket[key]) byBucket[key] = { count:0, cost:0, nbv:0 };
+    byBucket[key].count++;
+    byBucket[key].cost += (+a.cost||0);
+    const sched = Depreciation.schedule(a, thisYear());
+    const last = sched[sched.length-1];
+    const acc = last ? last.accumulated : 0;
+    byBucket[key].nbv += (+a.cost||0) - acc;
+  });
+  const bucketRows = Object.entries(byBucket).sort().map(([k,v])=>[k, v.count, {class:"num",value:fmt$(v.cost)}, {class:"num",value:fmt$(v.nbv)}]);
+  if (bucketRows.length) {
+    root.appendChild(el("h3",{style:"margin-top:16px;font-size:14px"},"Active by bucket"));
+    root.appendChild(tableEl(["Bucket","Count","Cost","NBV"], bucketRows));
+  }
+};
+
+VIEWS.trading = function(root) {
+  renderPoolRoster(root, {
+    poolType: "trading",
+    title: "Horses",
+    showBucket: false,
+    showPedigree: true,
+    showOwnership: true,
+    addLabel: "Add Horse"
+  });
+};
+
+// ============================================================
+// VIEW: Properties (grouped by property_group — one "property" can be multiple asset rows)
+// ============================================================
+VIEWS.properties = function(root) {
+  const header = el("div",{style:"display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px"},
+    el("h2",{},"Properties"),
+    el("div",{style:"display:flex;gap:6px;flex-wrap:wrap"},
+      el("button",{class:"btn", onclick:()=>openPropertyModal(null)}, "+ Add Property"),
+    )
+  );
+  root.appendChild(header);
+
+  // Group all assets with pool_type='property' by property_group
+  const props = STATE.assets.filter(a => a.pool_type === "property");
+  const groups = {};
+  props.forEach(a => {
+    const k = a.property_group || "(unnamed)";
+    (groups[k] = groups[k] || []).push(a);
+  });
+
+  // KPIs
+  const y = thisYear();
+  const totalCost = props.reduce((s,a)=>s+(+a.cost||0)+(+a.improvements_cost||0),0);
+  const totalLand = props.filter(a=>a.is_land).reduce((s,a)=>s+(+a.cost||0),0);
+  const depTot = Depreciation.yearTotals(props.filter(a=>!a.is_land && a.status==="active"), y);
+  const kpiRow = el("div",{class:"grid cols-4", style:"margin-bottom:10px"},
+    kpi("Properties", String(Object.keys(groups).length), props.length+" sub-assets"),
+    kpi("Total cost basis", fmt$(totalCost), fmt$(totalLand)+" land"),
+    kpi("Accum. depreciation", fmt$(depTot.accumulated), "Non-land only"),
+    kpi("Net book value", fmt$(totalCost - depTot.accumulated), "")
+  );
+  root.appendChild(kpiRow);
+
+  if (!Object.keys(groups).length) {
+    root.appendChild(el("div",{class:"msg warn"},"No properties yet. Click + Add Property to create one."));
+    return;
+  }
+
+  // Clean expandable table
+  const tbl = el("table",{style:"width:100%;border-collapse:collapse;font-size:13px;table-layout:fixed"});
+  // Fixed col widths to keep action button column from shifting
+  const colgroup = el("colgroup",{});
+  const widths = ["36px", "auto", "110px", "130px", "120px", "130px", "110px", "130px", "90px"];
+  widths.forEach(w => colgroup.appendChild(el("col",{style:"width:"+w})));
+  tbl.appendChild(colgroup);
+
+  const thStyle = "padding:10px 8px;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--muted);font-weight:600;border-bottom:2px solid var(--border);background:#faf8f5";
+  const thead = el("thead",{}, el("tr",{},
+    el("th",{style:thStyle}),
+    el("th",{style:thStyle+";text-align:left"}, "Property"),
+    el("th",{style:thStyle+";text-align:right"}, "Land"),
+    el("th",{style:thStyle+";text-align:right"}, "Buildings+Imp."),
+    el("th",{style:thStyle+";text-align:right"}, "Prior accum"),
+    el("th",{style:thStyle+";text-align:right"}, "Accum dep"),
+    el("th",{style:thStyle+";text-align:right"}, y+" dep"),
+    el("th",{style:thStyle+";text-align:right"}, "NBV"),
+    el("th",{style:thStyle+";text-align:right"}, "")
+  ));
+  tbl.appendChild(thead);
+  const tbody = el("tbody",{});
+  tbl.appendChild(tbody);
+
+  const tdNum = (v, opts={}) => el("td",{style:"padding:10px 8px;text-align:right;white-space:nowrap;"+(opts.style||"")}, v);
+  const tdText = (v, opts={}) => el("td",{style:"padding:10px 8px;vertical-align:middle;"+(opts.style||"")}, v);
+
+  Object.keys(groups).sort().forEach((pname, pIdx) => {
+    const items = groups[pname];
+    const land   = items.filter(a=>a.is_land).reduce((s,a)=>s+(+a.cost||0),0);
+    const bldg   = items.filter(a=>!a.is_land).reduce((s,a)=>s+(+a.cost||0)+(+a.improvements_cost||0),0);
+    const prior  = items.reduce((s,a)=>s+(+a.prior_accum_dep||0),0);
+    const yTot   = Depreciation.yearTotals(items.filter(a=>!a.is_land && a.status==="active"), y);
+    const nbv    = land + bldg - yTot.accumulated;
+
+    let expanded = false;
+    const caret = el("span",{style:"display:inline-block;color:var(--maroon);font-size:10px;transition:transform .15s"}, "▶");
+    const parentBg = pIdx%2 ? "#fcfaf7" : "#ffffff";
+    const parentRow = el("tr",{style:"cursor:pointer;border-bottom:1px solid var(--border);background:"+parentBg});
+    parentRow.onmouseover = () => parentRow.style.background = "#f5efe3";
+    parentRow.onmouseout  = () => parentRow.style.background = parentBg;
+
+    parentRow.appendChild(tdText(caret, {style:"text-align:center;"}));
+    parentRow.appendChild(tdText(el("div",{},
+      el("div",{style:"font-weight:600;color:#2e2520"}, pname),
+      el("div",{style:"font-size:11px;color:var(--muted);font-weight:400;margin-top:2px"}, items.length+" sub-asset"+(items.length!==1?"s":""))
+    )));
+    parentRow.appendChild(tdNum(fmt$(land), {style:"font-weight:500"}));
+    parentRow.appendChild(tdNum(fmt$(bldg), {style:"font-weight:500"}));
+    parentRow.appendChild(tdNum(fmt$(prior), {style:"color:var(--muted)"}));
+    parentRow.appendChild(tdNum(fmt$(yTot.accumulated), {style:"font-weight:500"}));
+    parentRow.appendChild(tdNum(fmt$(yTot.depreciation), {style:"font-weight:500"}));
+    parentRow.appendChild(tdNum(el("b",{},fmt$(nbv))));
+    parentRow.appendChild(tdText(
+      el("button",{class:"btn ghost sm",style:"white-space:nowrap;padding:4px 10px",
+        onclick:(e)=>{e.stopPropagation(); openPropertyModal(pname);}},"Edit"),
+      {style:"text-align:right"}
+    ));
+
+    const subRows = [];
+    items.sort((a,b)=> (a.is_land?0:1)-(b.is_land?0:1) || (a.description||"").localeCompare(b.description||""))
+      .forEach(sub => {
+        const sched = sub.is_land ? [] : Depreciation.schedule(sub, y);
+        const last = sched[sched.length-1];
+        const acc = last ? last.accumulated : (+sub.prior_accum_dep||0);
+        const cur = sched.find(r=>r.year===y);
+        const yExp = cur ? cur.total_expense : 0;
+        const subNBV = (+sub.cost||0) + (+sub.improvements_cost||0) - acc;
+        const subLand = sub.is_land ? (+sub.cost||0) : 0;
+        const subBldg = sub.is_land ? 0 : ((+sub.cost||0) + (+sub.improvements_cost||0));
+        const subCat = byId(STATE.categories, sub.category_id);
+        let subDesc = sub.description || "";
+        if (subDesc.toLowerCase().startsWith(pname.toLowerCase() + " - ")) subDesc = subDesc.slice(pname.length + 3);
+        const methodBrief = sub.is_land ? "land" : (sub.life_years||"")+"y "+({bonus:"Bonus",ddb:"DDB",db150:"150DB",sl:"SL"}[sub.method]||"");
+
+        const r = el("tr",{style:"border-bottom:1px solid #f0ebe0;background:#fbf9f5"});
+        r.appendChild(tdText("", {style:"border-left:3px solid var(--maroon);text-align:center;padding:6px"}));
+        r.appendChild(tdText(el("div",{style:"display:flex;align-items:center;gap:8px;padding-left:24px"},
+          subCat ? el("span",{class:"chip",style:"background:"+(subCat.color||"#999")+"22;color:"+(subCat.color||"#333")+";font-size:10px;padding:2px 6px"}, subCat.name) : "",
+          el("a",{href:"#",style:"color:var(--maroon);text-decoration:none;font-size:12px;font-weight:500",
+            onclick:ev=>{ev.preventDefault(); show("asset",{id:sub.id});}}, subDesc || (subCat?subCat.name:"(no name)")),
+          el("span",{style:"font-size:10px;color:var(--muted);margin-left:auto"}, methodBrief)
+        ), {style:"padding:6px 8px"}));
+        r.appendChild(tdNum(fmt$(subLand), {style:"font-size:12px;color:"+(subLand?"":"var(--muted)")+";padding:6px 8px"}));
+        r.appendChild(tdNum(fmt$(subBldg), {style:"font-size:12px;color:"+(subBldg?"":"var(--muted)")+";padding:6px 8px"}));
+        r.appendChild(tdNum(fmt$(+sub.prior_accum_dep||0), {style:"font-size:12px;color:var(--muted);padding:6px 8px"}));
+        r.appendChild(tdNum(fmt$(acc), {style:"font-size:12px;padding:6px 8px"}));
+        r.appendChild(tdNum(fmt$(yExp), {style:"font-size:12px;padding:6px 8px"}));
+        r.appendChild(tdNum(fmt$(subNBV), {style:"font-size:12px;padding:6px 8px"}));
+        r.appendChild(tdText(
+          el("button",{class:"btn ghost sm",style:"white-space:nowrap;font-size:11px;padding:3px 8px",
+            onclick:(e)=>{e.stopPropagation(); openAssetModal(sub.id);}},"Edit"),
+          {style:"text-align:right;padding:6px 8px"}
+        ));
+        r.style.display = "none";
+        subRows.push(r);
+      });
+
+    parentRow.addEventListener("click", () => {
+      expanded = !expanded;
+      caret.style.transform = expanded ? "rotate(90deg)" : "rotate(0deg)";
+      subRows.forEach(r => r.style.display = expanded ? "" : "none");
+    });
+
+    tbody.appendChild(parentRow);
+    subRows.forEach(r => tbody.appendChild(r));
+  });
+  root.appendChild(el("div",{style:"border:1px solid var(--border);border-radius:6px;overflow:hidden;background:#fff"}, tbl));
+};
+
+// ============================================================
+// Property add/edit modal — creates multiple asset rows in one go
+// ============================================================
+function openPropertyModal(existingGroup) {
+  // Collect existing sub-assets for this property (if editing)
+  const existing = existingGroup
+    ? STATE.assets.filter(a => a.pool_type==="property" && a.property_group===existingGroup)
+    : [];
+  const isNew = !existingGroup;
+
+  // Auto-pick the Solo Select Properties LLC entity if present, else first entity
+  const defaultEntity = STATE.entities.find(e => /solo select properties/i.test(e.name||""))
+    || STATE.entities[0] || null;
+
+  // Build a list of "lines" — each line = one asset to create/update
+  // Seed with typical 3-line shape for new: Land, Building, Improvements
+  function emptyLine(category, extra) {
+    const catId = (STATE.categories.find(c => c.name === category) || {}).id || null;
+    return Object.assign({
+      id: null,
+      description: "",
+      category_id: catId,
+      entity_id: defaultEntity ? defaultEntity.id : null,
+      cost: 0,
+      land_value: 0,
+      improvements_cost: 0,
+      prior_accum_dep: 0,
+      in_service_date: todayISO(),
+      method: null, life_years: null, convention: null, bonus_pct: 0, section_179: 0,
+      is_land: category === "Land",
+      notes: "",
+    }, extra||{});
+  }
+  // Convert existing assets into the "line" shape
+  const lines = isNew
+    ? [ emptyLine("Land"), emptyLine("Residential Buildings"), emptyLine("Capitalized Building Improvements") ]
+    : existing.map(a => Object.assign({}, a, { id: a.id }));
+
+  const state = {
+    propertyName: existingGroup || "",
+    purchaseDate: (existing[0] && existing[0].in_service_date) || todayISO(),
+  };
+
+  const linesHost = el("div",{});
+  function render() {
+    linesHost.innerHTML = "";
+    const lineDateInputs = []; // refs per line so cascade can update DOM directly
+    lines.forEach((ln, idx) => {
+      const box = el("div",{style:"border:1px solid var(--border);border-radius:6px;padding:10px;margin-bottom:8px;background:#faf8f5"});
+      const c = byId(STATE.categories, ln.category_id);
+      const applyCatDefaults = () => {
+        const cat = byId(STATE.categories, ln.category_id);
+        if (!cat) return;
+        ln.is_land = cat.name === "Land";
+        const presets = {
+          "Residential Buildings":            { method:"sl", life_years:27.5, convention:"mid_month" },
+          "Commercial Buildings":             { method:"sl", life_years:39,   convention:"mid_month" },
+          "Agricultural Buildings":           { method:"sl", life_years:20,   convention:"half_year" },
+          "Capitalized Building Improvements":{ method:"sl", life_years:27.5, convention:"mid_month" },
+          "Land Improvements":                { method:"sl", life_years:15,   convention:"half_year" },
+          "Fencing":                          { method:"ddb", life_years:7,   convention:"half_year" },
+          "Farm Equipment":                   { method:"ddb", life_years:7,   convention:"half_year" },
+          "Furniture & Fixtures":             { method:"ddb", life_years:7,   convention:"half_year" },
+        };
+        const p = presets[cat.name];
+        if (p) { ln.method=p.method; ln.life_years=p.life_years; ln.convention=p.convention; }
+      };
+      box.appendChild(el("div",{style:"display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"},
+        el("div",{style:"font-weight:600;color:var(--maroon)"},"Line " + (idx+1) + (c ? " — " + c.name : "")),
+        el("button",{class:"btn ghost sm",style:"color:var(--err)",onclick:()=>{ lines.splice(idx,1); render(); }},"Remove")
+      ));
+      // Date field — cascade from line 0 to others without re-rendering (preserves focus)
+      const dateInput = el("input",{type:"date",value:ln.in_service_date||state.purchaseDate});
+      dateInput.addEventListener("input", e => {
+        ln.in_service_date = e.target.value;
+        if (idx !== 0) ln._dateManual = true; // only mark manual for non-first lines
+        if (idx === 0) {
+          // Cascade to sibling lines that haven't been manually edited — update their inputs directly
+          lines.forEach((other, i) => {
+            if (i !== 0 && !other._dateManual) {
+              other.in_service_date = e.target.value;
+              if (lineDateInputs[i]) lineDateInputs[i].value = e.target.value;
+            }
+          });
+        }
+      });
+      lineDateInputs[idx] = dateInput;
+      const grid = el("div",{class:"grid cols-3"},
+        field("Category *", (()=>{
+          const s = el("select",{onchange:e=>{ ln.category_id=e.target.value||null; applyCatDefaults(); render(); }});
+          s.appendChild(el("option",{value:""},"— select —"));
+          STATE.categories.forEach(c => s.appendChild(el("option",{value:c.id}, c.name)));
+          if (ln.category_id) s.value = ln.category_id;
+          return s;
+        })()),
+        field("Description / sub-account", el("input",{type:"text",value:ln.description||"",oninput:e=>ln.description=e.target.value})),
+        field("In-service date" + (idx===0 ? " (cascades ↓)" : ""), dateInput)
+      );
+      box.appendChild(grid);
+      box.appendChild(el("div",{class:"grid cols-2"},
+        field("Cost", moneyInput({value:ln.cost, onChange:v=>ln.cost=v})),
+        field("Prior accum. dep. (already taken)", moneyInput({value:ln.prior_accum_dep, onChange:v=>ln.prior_accum_dep=v}))
+      ));
+      // Advanced depreciation overrides — hidden by default; category presets handle it
+      if (!ln.is_land) {
+        const lifeLabel = ln.life_years ? (ln.life_years + " yr") : "auto";
+        const methodLabel = ({sl:"Straight Line","ddb":"200% DDB","db150":"150% DB","bonus":"Bonus+DDB"})[ln.method] || ln.method || "auto";
+        const convLabel = ({half_year:"Half-Year",mid_quarter:"Mid-Quarter",mid_month:"Mid-Month"})[ln.convention] || "auto";
+        const adv = el("details",{},
+          el("summary",{style:"cursor:pointer;font-size:11px;color:var(--muted);margin-top:6px"},
+            "Depreciation: "+methodLabel+" · "+lifeLabel+" · "+convLabel+" (auto-set — click to override)")
+        );
+        const methodSel = el("select",{onchange:e=>ln.method=e.target.value},
+          ...[["sl","Straight Line"],["ddb","200% DDB"],["db150","150% DB"],["bonus","Bonus + DDB"]].map(([v,l])=>{
+            const o = el("option",{value:v},l); if (ln.method===v) o.selected = true; return o;
+          })
+        );
+        const convSel = el("select",{onchange:e=>ln.convention=e.target.value},
+          ...[["half_year","Half-Year"],["mid_quarter","Mid-Quarter"],["mid_month","Mid-Month"]].map(([v,l])=>{
+            const o = el("option",{value:v},l); if (ln.convention===v) o.selected = true; return o;
+          })
+        );
+        adv.appendChild(el("div",{class:"grid cols-3",style:"margin-top:6px"},
+          field("Method", methodSel),
+          field("Life (years)", el("input",{type:"number",step:"0.5",min:"0.5",value:ln.life_years||"",oninput:e=>ln.life_years=+e.target.value||0})),
+          field("Convention", convSel)
+        ));
+        box.appendChild(adv);
+      }
+      linesHost.appendChild(box);
+    });
+    // Add-line button
+    linesHost.appendChild(el("div",{style:"display:flex;gap:8px;flex-wrap:wrap;margin-top:6px"},
+      el("button",{class:"btn ghost sm",onclick:()=>{ lines.push(emptyLine("Land")); render(); }},"+ Land"),
+      el("button",{class:"btn ghost sm",onclick:()=>{ lines.push(emptyLine("Residential Buildings")); render(); }},"+ Residential Building"),
+      el("button",{class:"btn ghost sm",onclick:()=>{ lines.push(emptyLine("Agricultural Buildings")); render(); }},"+ Ag Building"),
+      el("button",{class:"btn ghost sm",onclick:()=>{ lines.push(emptyLine("Capitalized Building Improvements")); render(); }},"+ Improvements"),
+      el("button",{class:"btn ghost sm",onclick:()=>{ lines.push(emptyLine("Land Improvements")); render(); }},"+ Land Improvements"),
+      el("button",{class:"btn ghost sm",onclick:()=>{ lines.push(emptyLine("Fencing")); render(); }},"+ Fencing"),
+      el("button",{class:"btn ghost sm",onclick:()=>{ lines.push(emptyLine("Farm Equipment")); render(); }},"+ Equipment"),
+      el("button",{class:"btn ghost sm",onclick:()=>{ lines.push(emptyLine(null)); render(); }},"+ Other")
+    ));
+  }
+  render();
+
+  modal({ title: isNew ? "Add Property" : "Edit Property — " + existingGroup,
+    wide: true,
+    body: el("div",{class:"grid"},
+      el("div",{class:"grid cols-2"},
+        field("Property name * (e.g., 109 W Pecan)", el("input",{type:"text",value:state.propertyName,oninput:e=>state.propertyName=e.target.value})),
+        field("Entity", (()=>{
+          const s = entitySelect({value: defaultEntity?defaultEntity.id:"", onchange:v=>state.entity_id=v});
+          state.entity_id = defaultEntity ? defaultEntity.id : null;
+          return s;
+        })())
+      ),
+      field("Purchase / default in-service date", el("input",{type:"date",value:state.purchaseDate,oninput:e=>{
+        state.purchaseDate=e.target.value;
+        // Push date to any line that doesn't have one set manually (crude)
+        lines.forEach(ln => { if (!ln.id) ln.in_service_date = state.purchaseDate; });
+      }})),
+      el("h3",{style:"margin:10px 0 4px;font-size:13px;color:var(--maroon)"},"Sub-accounts (each becomes its own asset row)"),
+      linesHost
+    ),
+    saveLabel: isNew ? "Create property" : "Save changes",
+    onSave: async () => {
+      if (!state.propertyName.trim()) throw new Error("Enter a property name.");
+      if (!lines.length) throw new Error("Add at least one sub-account line.");
+      if (!state.entity_id) throw new Error("Pick an entity.");
+      const propName = state.propertyName.trim();
+      let created = 0, updated = 0;
+      for (const ln of lines) {
+        if (!ln.category_id) throw new Error("Every line needs a category.");
+        if (!ln.cost && !ln.improvements_cost) continue; // skip empty
+        const cat = byId(STATE.categories, ln.category_id);
+        const payload = {
+          pool_type: "property",
+          property_group: propName,
+          entity_id: state.entity_id,
+          category_id: ln.category_id,
+          description: ln.description || (propName + " - " + (cat?cat.name:"")),
+          cost: +ln.cost || 0,
+          improvements_cost: +ln.improvements_cost || 0,
+          land_value: 0, // stored in separate land asset, not on buildings
+          prior_accum_dep: +ln.prior_accum_dep || 0,
+          in_service_date: ln.in_service_date || state.purchaseDate,
+          // method/life/convention are NOT NULL in DB. For land, store placeholder values —
+          // is_land=true makes the engine skip the schedule entirely so these values are never used.
+          method: ln.method || "sl",
+          life_years: ln.life_years || 27.5,
+          convention: ln.convention || "mid_month",
+          bonus_pct: 0,
+          section_179: 0,
+          is_land: !!ln.is_land,
+          status: "active",
+          notes: ln.notes || null,
+        };
+        if (!ln.id) payload.created_by = USER.email;
+        if (ln.id) {
+          await updateRec("assets", ln.id, Object.assign({}, payload, { updated_at: new Date().toISOString() }));
+          updated++;
+          await logActivity("asset", ln.id, "update", "Property "+propName+" — updated "+(cat?cat.name:"line"));
+        } else {
+          const saved = await insertRec("assets", payload);
+          created++;
+          await logActivity("asset", saved.id, "create", "Property "+propName+" — created "+(cat?cat.name:"line")+" at "+fmt$(payload.cost));
+        }
+      }
+      await refreshAll();
+      show("properties");
+      flash("Saved "+propName+": "+created+" created, "+updated+" updated");
+    }
+  });
+}
+
+// ============================================================
+// Pool CSV import / export
+// ============================================================
+function exportPoolCSV(poolType) {
+  const pool = STATE.assets.filter(a => a.pool_type === poolType);
+  const y = thisYear();
+  const headers = ["asset_number","description","bucket_tag","foaling_year","color","sex","sire","dam",
+    "in_service_date","cost","salvage_value","section_179","bonus_pct","method","life_years","convention",
+    "ownership_pct","is_inventory","entity_name","status","accum_dep","nbv"];
+  const rows = pool.map(a => {
+    const sched = a.is_inventory ? [] : Depreciation.schedule(a, y);
+    const last = sched[sched.length-1];
+    const acc = last ? last.accumulated : 0;
+    const nbv = (+a.cost||0) - acc;
+    const ent = byId(STATE.entities, a.entity_id);
+    return [a.asset_number||"", a.description||"", a.bucket_tag||"", a.foaling_year||"", a.color||"",
+      a.sex||"", a.sire||"", a.dam||"", a.in_service_date||"", a.cost||0, a.salvage_value||0,
+      a.section_179||0, a.bonus_pct||0, a.method||"", a.life_years||"", a.convention||"",
+      a.ownership_pct==null?100:a.ownership_pct, a.is_inventory?"true":"false",
+      ent?ent.name:"", a.status||"", r2(acc), r2(nbv)];
+  });
+  downloadCSV((poolType==="recip_mare"?"recip_mares":"trading_horses")+"_"+todayISO()+".csv", headers, rows);
+}
+
+function openPoolImportModal(poolType) {
+  const isRecip = (poolType === "recip_mare");
+  const defaultBucket = isRecip ? "Solo - Post Cutover" : "";
+  const tmplRecip = "asset_number,description,bucket_tag,foaling_year,color,sex,sire,dam,in_service_date,cost,section_179,bonus_pct,method,life_years,convention,entity_name,notes\n"
+    + "M1234,Mare 1234,Solo Horses,2018,bay,f,Super Sire,Good Dam,2020-06-15,15000,0,20,bonus,7,half_year,Solo Farms,Example row\n";
+  const tmplTrad = "asset_number,description,foaling_year,color,sex,sire,dam,in_service_date,cost,ownership_pct,is_inventory,section_179,bonus_pct,method,life_years,convention,entity_name,notes\n"
+    + "T-001,Colt 22 bay,2022,bay,c,Super Sire,Good Dam,2023-05-01,25000,50,false,0,20,bonus,7,half_year,Solo Farms,Example row\n";
+  const tmpl = isRecip ? tmplRecip : tmplTrad;
+  let csvText = "";
+  const ta = el("textarea",{rows:12,style:"width:100%;font-family:monospace;font-size:12px",
+    placeholder:"Paste CSV here (header row required)…",oninput:e=>csvText=e.target.value});
+  const preview = el("div",{style:"margin-top:8px;max-height:240px;overflow:auto;font-size:12px"});
+  function parseCSV(txt) {
+    const lines = txt.split(/\r?\n/).filter(l=>l.trim());
+    if (!lines.length) return { header:[], rows:[] };
+    const parseLine = line => {
+      const out=[]; let cur=""; let q=false;
+      for (let i=0;i<line.length;i++) {
+        const ch=line[i];
+        if (q) {
+          if (ch==='"' && line[i+1]==='"') { cur+='"'; i++; }
+          else if (ch==='"') q=false;
+          else cur+=ch;
+        } else {
+          if (ch===',') { out.push(cur); cur=""; }
+          else if (ch==='"') q=true;
+          else cur+=ch;
+        }
+      }
+      out.push(cur); return out;
+    };
+    const header = parseLine(lines[0]).map(h=>h.trim());
+    const rows = lines.slice(1).map(parseLine);
+    return { header, rows };
+  }
+  modal({ title:"Import "+(isRecip?"Recip Mares":"Trading Horses")+" CSV",
+    wide: true,
+    body: el("div",{class:"grid"},
+      el("div",{class:"msg warn"},"Seed your roster from CSV. Matches existing rows by asset_number (within the same pool) — re-importing is safe. Dates in ISO format (YYYY-MM-DD)."),
+      el("details",{},
+        el("summary",{style:"cursor:pointer;font-size:12px"},"Template / column reference"),
+        el("pre",{style:"background:#faf8f5;padding:8px;border-radius:4px;font-size:11px;overflow:auto"}, tmpl)
+      ),
+      field("Paste CSV", ta),
+      el("button",{class:"btn ghost sm",onclick:()=>{
+        const { header, rows } = parseCSV(csvText);
+        preview.innerHTML = "";
+        if (!header.length) { preview.textContent = "No CSV detected."; return; }
+        preview.appendChild(el("div",{style:"margin-bottom:4px;color:var(--muted)"},"Preview: "+rows.length+" rows · "+header.length+" columns"));
+        const tbl = el("table",{style:"width:100%;border-collapse:collapse;font-size:11px"});
+        tbl.appendChild(el("thead",{},el("tr",{},header.map(h=>el("th",{style:"text-align:left;padding:3px 6px;background:#eee;border-bottom:1px solid #ccc"},h)))));
+        const tb = el("tbody",{});
+        rows.slice(0,20).forEach(r => tb.appendChild(el("tr",{},r.map(c=>el("td",{style:"padding:3px 6px;border-bottom:1px dotted #ddd"},c)))));
+        tbl.appendChild(tb);
+        preview.appendChild(tbl);
+        if (rows.length>20) preview.appendChild(el("div",{class:"small"},"… and "+(rows.length-20)+" more"));
+      }},"Preview"),
+      preview
+    ),
+    saveLabel:"Import",
+    onSave: async() => {
+      const { header, rows } = parseCSV(csvText);
+      if (!header.length) throw new Error("Paste a CSV with a header row.");
+      if (!rows.length) throw new Error("No data rows.");
+      const idx = Object.fromEntries(header.map((h,i)=>[h.toLowerCase(),i]));
+      const required = ["description","in_service_date","cost"];
+      for (const r of required) {
+        if (idx[r] == null) throw new Error("Missing required column: "+r);
+      }
+      const catName = isRecip ? "Recipient Mares" : "Trading Horses";
+      const cat = STATE.categories.find(c => c.name === catName);
+      if (!cat) throw new Error("Category '"+catName+"' missing. Run the SQL migration first.");
+
+      // Map entity_name -> id
+      const entByName = {};
+      STATE.entities.forEach(e => entByName[(e.name||"").toLowerCase()] = e.id);
+
+      let inserted = 0, updated = 0, skipped = 0;
+      const errors = [];
+      for (const row of rows) {
+        const get = k => { const i=idx[k]; return i==null ? "" : (row[i]||"").trim(); };
+        const num = k => { const v=get(k); return v===""?null:(+v); };
+        const bool = k => { const v=get(k).toLowerCase(); return v==="true"||v==="1"||v==="yes"; };
+        try {
+          const description = get("description");
+          const cost = num("cost");
+          const in_service_date = get("in_service_date");
+          if (!description || !cost || !in_service_date) { skipped++; continue; }
+
+          const entityRaw = get("entity_name");
+          const entity_id = entityRaw ? (entByName[entityRaw.toLowerCase()] || null) : null;
+          if (entityRaw && !entity_id) throw new Error("Entity not found: "+entityRaw);
+          if (!entity_id) {
+            // Fallback: use the first entity
+            if (!STATE.entities.length) throw new Error("No entities exist. Create one first.");
+          }
+
+          const payload = {
+            pool_type: poolType,
+            category_id: cat.id,
+            entity_id: entity_id || (STATE.entities[0] && STATE.entities[0].id),
+            description,
+            asset_number: get("asset_number"),
+            bucket_tag: isRecip ? (get("bucket_tag") || defaultBucket) : null,
+            foaling_year: num("foaling_year"),
+            color: get("color") || null,
+            sex: get("sex") || null,
+            sire: get("sire") || null,
+            dam: get("dam") || null,
+            in_service_date,
+            cost: cost,
+            salvage_value: num("salvage_value") || 0,
+            section_179: num("section_179") || 0,
+            // OBBB: default 100% bonus on anything placed in service on/after 2025-01-20; else 0.
+            bonus_pct: (() => {
+              const v = num("bonus_pct");
+              if (v != null) return v;
+              const d = get("in_service_date");
+              return d && d >= "2025-01-20" ? 100 : 0;
+            })(),
+            method: get("method") || "bonus",
+            life_years: num("life_years") || 7,
+            convention: get("convention") || "half_year",
+            ownership_pct: isRecip ? 100 : (num("ownership_pct") == null ? 100 : num("ownership_pct")),
+            is_inventory: bool("is_inventory"),
+            notes: get("notes") || null,
+            status: "active",
+            created_by: USER.email,
+          };
+
+          // Match on (pool_type + asset_number) if provided
+          const existing = payload.asset_number
+            ? STATE.assets.find(a => a.pool_type===poolType && a.asset_number===payload.asset_number)
+            : null;
+          if (existing) {
+            await updateRec("assets", existing.id, Object.assign({}, payload, { updated_at: new Date().toISOString() }));
+            await logActivity("asset", existing.id, "update", "CSV import updated "+description, { source:"csv_import" });
+            updated++;
+          } else {
+            const saved = await insertRec("assets", payload);
+            await logActivity("asset", saved.id, "create", "CSV import created "+description+" — cost "+fmt$(cost), { source:"csv_import" });
+            inserted++;
+          }
+        } catch(e) {
+          errors.push(e.message || String(e));
+        }
+      }
+      await refreshAll();
+      show(poolType==="recip_mare" ? "recip_mares" : "trading");
+      const msg = "Imported: "+inserted+" new, "+updated+" updated, "+skipped+" skipped"+(errors.length?" · "+errors.length+" errors":"");
+      flash(msg, errors.length?"warn":"ok");
+      if (errors.length) console.warn("Import errors:", errors);
+    }
+  });
 }
 
 // ============================================================
