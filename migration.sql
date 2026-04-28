@@ -56,11 +56,18 @@ union all
 select 'orphan active-with-disposal', count(*) from assets a where a.status='active' and exists (select 1 from disposals d where d.asset_id=a.id);
 
 -- ========================================================
--- 6) Tax-form support: property_type + prior depreciation
+-- 6) Form 4797 support: property_type on categories + assets
 -- ========================================================
--- '1245' = personal property (equipment, vehicles, AG fences) — full depreciation recapture as ordinary income
--- '1250' = real property (buildings, residential rental) — only "additional depreciation" recaptured
--- 'none' = land or other non-depreciable / non-recapture property
+-- '1245' = personal property (equipment, vehicles, livestock incl. recip mares
+--          and trading horses, AG fences) — full depreciation recapture as
+--          ordinary income on disposal.
+-- '1250' = real property (buildings, residential rental) — post-1986 SL
+--          property typically has 0 ordinary recapture; full gain is §1231.
+-- 'none' = land or other non-depreciable / non-recapture property.
+--
+-- The category gets a default; per-asset rows can override.
+-- Until this block is run, the app falls back to a smart heuristic
+-- (life ≥ 27 yrs ⇒ §1250, land ⇒ none, else ⇒ §1245) and hides the override UI.
 alter table categories
   add column if not exists property_type text default '1245'
   check (property_type in ('1245','1250','none'));
@@ -69,11 +76,6 @@ alter table assets
   add column if not exists property_type text
   check (property_type in ('1245','1250','none'));
 
--- Prior depreciation: for assets imported mid-life from another system
--- (e.g. Ranch Management). prior_depreciation is the accumulated total
--- already booked elsewhere; prior_through_date is the last day that prior
--- accumulation covers. The engine resumes booking AFTER that date.
-alter table assets
-  add column if not exists prior_depreciation numeric(14,2) default 0;
-alter table assets
-  add column if not exists prior_through_date date;
+-- Note: prior depreciation already supported in this app via the
+-- `prior_accum_dep` column on assets (see depreciation engine). No migration
+-- needed for that feature.
