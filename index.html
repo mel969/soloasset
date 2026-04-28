@@ -212,17 +212,56 @@
     const bonusAmt=r2(postSec*(bonusPct/100));
     const depBasis=Math.max(postSec-bonusAmt-salvage,0);
     const dbRate=method==="ddb"?2/life:method==="db150"?1.5/life:method==="bonus"?2/life:0;
+
+    // Prior depreciation: asset was depreciated in another system through
+    // prior_through_date with a known accumulated amount. We skip booking
+    // for any year on/before that date, then resume from the carryover.
+    const priorDep = Math.max(0, +a.prior_depreciation || 0);
+    const priorThruDate = a.prior_through_date ? new Date(a.prior_through_date) : null;
+    const priorThruYear = priorThruDate ? yearOf(priorThruDate) : null;
+    const hasPrior = priorDep > 0 && priorThruYear != null;
+
     const rows=[]; let nbv=cost, remaining=depBasis, accum=0;
+
+    if (hasPrior) {
+      // Prior dep is assumed to have already absorbed §179 + bonus + some
+      // regular depreciation. Whatever is left to book is depBasis minus the
+      // portion of prior dep that exceeded §179+bonus (clamped at 0).
+      accum = priorDep;
+      nbv = Math.max(cost - priorDep, 0);
+      const eatenAgainstBasis = Math.max(priorDep - sec179 - bonusAmt, 0);
+      remaining = Math.max(depBasis - eatenAgainstBasis, 0);
+    }
+
     const maxYears=Math.ceil(life)+3;
     for (let k=0; k<maxYears; k++) {
       const y=inYear+k;
       if (throughYear!=null && y>throughYear) break;
       if (disposed && y>dispYear) break;
+
+      // Skip years entirely covered by prior-system depreciation.
+      if (hasPrior && y < priorThruYear) continue;
+
       const isFirst=k===0, isDisp=disposed && y===dispYear;
       const used=isFirst?0:firstFrac+(k-1);
       const remLife=Math.max(life-used,0.0001);
+
+      // Carryover row: surface the prior accum at the boundary year, no
+      // current-year expense (it was already booked elsewhere).
+      if (hasPrior && y === priorThruYear) {
+        rows.push({year:y,opening_nbv:r2(cost),sec179:0,bonus:0,
+          depreciation:0,total_expense:0,accumulated:r2(priorDep),
+          closing_nbv:r2(nbv),
+          notes:"Prior dep carryover thru "+a.prior_through_date});
+        if (isDisp) break;
+        continue;
+      }
+
       let s179=0,bon=0,dep=0; const openingNbv=nbv; const notes=[];
-      if (isFirst) {
+
+      // §179 + bonus only apply on the in-service year, and only if there
+      // wasn't prior depreciation (priorDep already includes them).
+      if (isFirst && !hasPrior) {
         s179=sec179; bon=bonusAmt;
         nbv-=(s179+bon); accum+=(s179+bon);
         if (s179>0) notes.push("§179 $"+s179.toLocaleString());
@@ -233,13 +272,13 @@
         if (method==="sl") fy=depBasis/life;
         else { const db=remaining*dbRate, sl=remaining/remLife; fy=Math.max(db,sl); }
         let frac=1;
-        if (isFirst) frac=firstFrac;
+        if (isFirst && !hasPrior) frac=firstFrac;
         if (isDisp)  frac=disposalYearFraction(conv,dispDate);
-        if (isFirst && isDisp) frac=Math.min(firstFrac,disposalYearFraction(conv,dispDate));
+        if (isFirst && isDisp && !hasPrior) frac=Math.min(firstFrac,disposalYearFraction(conv,dispDate));
         dep=Math.min(fy*frac,remaining); dep=r2(dep);
         remaining-=dep; nbv-=dep; accum+=dep;
       }
-      if (bonusPct>=100 && isFirst && remaining<0.005) notes.push("Fully expensed year 1");
+      if (bonusPct>=100 && isFirst && !hasPrior && remaining<0.005) notes.push("Fully expensed year 1");
       rows.push({year:y,opening_nbv:r2(openingNbv),sec179:r2(s179),bonus:r2(bon),
         depreciation:r2(dep),total_expense:r2(s179+bon+dep),accumulated:r2(accum),
         closing_nbv:r2(nbv),notes:notes.join("; ")});
@@ -272,8 +311,29 @@
 let sb = null;                 // supabase client
 let USER = null;               // { email, role, id }
 let STATE = {
-  entities: [], categories: [], assets: [], transfers: [], disposals: [], allowed: []
+  entities: [], categories: [], assets: [], transfers: [], disposals: [], allowed: [],
+  // taxColsReady becomes true once the migration.sql §6 block has been run
+  // (adds property_type / prior_depreciation / prior_through_date). While
+  // false, the new tax-form UI fields are hidden and stripped from saves so
+  // the app keeps working without the migration.
+  taxColsReady: true
 };
+
+const MIGRATION_SQL = [
+  "alter table categories",
+  "  add column if not exists property_type text default '1245'",
+  "  check (property_type in ('1245','1250','none'));",
+  "",
+  "alter table assets",
+  "  add column if not exists property_type text",
+  "  check (property_type in ('1245','1250','none'));",
+  "",
+  "alter table assets",
+  "  add column if not exists prior_depreciation numeric(14,2) default 0;",
+  "",
+  "alter table assets",
+  "  add column if not exists prior_through_date date;"
+].join("\n");
 
 // ------- helpers -------
 const $ = sel => document.querySelector(sel);
@@ -303,6 +363,43 @@ const flash = (msg, type="ok") => {
 };
 const METHOD_LABELS = { bonus:"Bonus + DDB", ddb:"200% DDB", db150:"150% DB", sl:"Straight Line" };
 const CONV_LABELS   = { half_year:"Half-Year", mid_quarter:"Mid-Quarter", mid_month:"Mid-Month" };
+const PROP_TYPE_LABELS = { "1245":"§1245 (personal property)", "1250":"§1250 (real property)", "none":"None / non-recapture" };
+
+// Resolve effective property type: per-asset override wins, else category default,
+// else heuristic (real property if life ≥ 27 years), else §1245.
+function effectivePropertyType(a) {
+  if (a && a.property_type) return a.property_type;
+  const c = a && a.category_id ? byId(STATE.categories, a.category_id) : null;
+  if (c && c.property_type) return c.property_type;
+  if ((+(a&&a.life_years)||0) >= 27) return "1250";
+  return "1245";
+}
+function effectivePropertyTypeLabel(a) {
+  return PROP_TYPE_LABELS[effectivePropertyType(a)] || effectivePropertyType(a);
+}
+
+// Banner shown at the top of Reports (and elsewhere) when the tax-form
+// migration block hasn't been run yet. Surfaces the SQL to copy-paste and a
+// re-check button. Reports themselves still work via heuristic fallback.
+function migrationBanner() {
+  const sql = el("textarea",{readonly:true,style:"width:100%;height:140px;font-family:ui-monospace,Menlo,monospace;font-size:11px;background:#fff;border:1px solid var(--border);border-radius:4px;padding:8px;margin-top:6px"}, MIGRATION_SQL);
+  const wrap = el("div",{class:"card",style:"border-left:4px solid var(--warn,#c98a2b);margin-bottom:14px"},
+    el("div",{class:"bd"},
+      el("h3",{style:"margin:0 0 4px"}, "Database migration pending — tax form features partially active"),
+      el("p",{class:"small",style:"margin:0 0 8px"},
+        "Form 4797 and Form 4562 reports work using sensible defaults (any asset with life ≥ 27 yrs is treated as §1250 real property; everything else as §1245). To enable the per-asset property-type override, prior-depreciation handling, and the property-type column on categories, run this in Supabase Studio → SQL Editor:"),
+      sql,
+      el("div",{style:"margin-top:8px;display:flex;gap:6px"},
+        el("button",{class:"btn",onclick:async()=>{
+          try { await navigator.clipboard.writeText(MIGRATION_SQL); flash("SQL copied — paste into Studio SQL Editor"); }
+          catch(_){ sql.select(); document.execCommand("copy"); flash("SQL copied"); }
+        }},"Copy SQL"),
+        el("button",{class:"btn ghost",onclick:async()=>{ await refreshAll(); show("reports"); flash(STATE.taxColsReady?"Migration detected — features enabled":"Still pending","warn"); }},"I just ran it — re-check")
+      )
+    )
+  );
+  return wrap;
+}
 
 // ------- modal -------
 function modal({title, body, onSave, saveLabel="Save", wide=false, footer=null}) {
@@ -397,6 +494,13 @@ async function refreshAll() {
     sb.from("disposals").select("*").order("disposal_date",{ascending:false}),
     sb.from("allowed_emails").select("*").order("email"),
   ]);
+  // Probe whether the tax-form columns from migration.sql §6 are present.
+  // We try selecting one of them; if Postgres errors with column-not-found
+  // (PGRST/42703), we hide the related UI and strip those keys on save.
+  try {
+    const probe = await sb.from("categories").select("property_type").limit(1);
+    STATE.taxColsReady = !probe.error;
+  } catch (_) { STATE.taxColsReady = false; }
   STATE.entities = ent.data || [];
   STATE.categories = cat.data || [];
   STATE.assets = as.data || [];
@@ -442,8 +546,10 @@ async function remove(table, id) {
 // ------- routing -------
 const VIEWS = {};
 function show(name, ctx) {
-  // "asset" is a synthetic detail view — keep "assets" tab active for it.
-  const tabKey = (name === "asset") ? "assets" : name;
+  // "asset" / "entity" are synthetic detail views — keep their list tab active.
+  const tabKey = (name === "asset") ? "assets"
+               : (name === "entity") ? "entities"
+               : name;
   $$("nav.side .tab").forEach(b => b.classList.toggle("active", b.dataset.view===tabKey));
   const v = $("#view");
   v.innerHTML = "";
@@ -494,7 +600,7 @@ VIEWS.dashboard = function(root) {
   const entLink = (name) => {
     const en = STATE.entities.find(x=>x.name===name);
     const a = el("a",{href:"#",style:"color:var(--maroon);text-decoration:none;font-weight:600;cursor:pointer"},name);
-    a.onclick = (e) => { e.preventDefault(); show("assets",{entity_id: en?en.id:"__none__", status:"active"}); };
+    a.onclick = (e) => { e.preventDefault(); if (en) show("entity",{id:en.id}); else show("assets",{entity_id:"__none__", status:"active"}); };
     return a;
   };
   root.appendChild(card("By category",
@@ -669,12 +775,12 @@ function categorySelect({allowAll=false, value=null, onchange=null}={}) {
 }
 
 // ---------- Asset create/edit modal ----------
-function openAssetModal(id) {
-  const a = id ? Object.assign({}, byId(STATE.assets, id)) : {
+function openAssetModal(id, defaults) {
+  const a = id ? Object.assign({}, byId(STATE.assets, id)) : Object.assign({
     description:"", cost:0, salvage_value:0, in_service_date: todayISO(),
     method:"ddb", life_years:5, convention:"half_year", bonus_pct:0, section_179:0,
     status:"active"
-  };
+  }, defaults || {});
   const f = {};
   function refreshPreview() {
     const prev = f.preview;
@@ -703,6 +809,7 @@ function openAssetModal(id) {
         if (c.default_convention) { a.convention=c.default_convention; f.conv.value=a.convention; }
       }
     }
+    if (f.propTypeHint) f.propTypeHint.textContent = effectivePropertyTypeLabel(a);
     refreshPreview();
   };
   const bindInput = (k, inp, num=false) => { inp.addEventListener("input", ()=>{ a[k] = num ? (+inp.value||0) : inp.value; refreshPreview(); }); return inp; };
@@ -742,6 +849,28 @@ function openAssetModal(id) {
       field("Location", bindInput("location", el("input",{type:"text",value:a.location||""}))),
       field("Vendor",   bindInput("vendor", el("input",{type:"text",value:a.vendor||""}))),
     ),
+    STATE.taxColsReady ? el("div",{class:"grid cols-2"},
+      field("Tax property type (Form 4797)", (() => {
+        const wrap = el("div",{});
+        const s = el("select",{onchange: e=>{ a.property_type = e.target.value || null; f.propTypeHint.textContent = effectivePropertyTypeLabel(a); }});
+        s.appendChild(el("option",{value:""}, "Use category / auto"));
+        Object.entries(PROP_TYPE_LABELS).forEach(([v,l])=>s.appendChild(el("option",{value:v},l)));
+        s.value = a.property_type || "";
+        wrap.appendChild(s);
+        f.propTypeHint = el("div",{class:"small",style:"margin-top:4px;color:var(--muted)"}, effectivePropertyTypeLabel(a));
+        wrap.appendChild(f.propTypeHint);
+        return wrap;
+      })()),
+      el("div",{},
+        el("div",{class:"small",style:"color:var(--muted);font-weight:600;margin-bottom:4px"}, "Prior depreciation (imported assets)"),
+        el("div",{class:"grid cols-2"},
+          field("Prior accum. dep.", bindInput("prior_depreciation", el("input",{type:"number",step:"0.01",min:"0",value:a.prior_depreciation||0}), true)),
+          field("Prior thru date",   bindInput("prior_through_date", el("input",{type:"date",value:a.prior_through_date||""}))),
+        ),
+        el("div",{class:"small",style:"color:var(--muted)"}, "Use when bringing in an asset that was already depreciating in another system (e.g. Ranch Management). The engine will resume booking after this date."),
+      ),
+    ) : el("div",{class:"msg warn",style:"font-size:12px"},
+      "Tax-form fields (property type, prior depreciation) are hidden until the database migration is run. Reports → Form 4797 / 4562 still work using sensible defaults."),
     el("details",{},
       el("summary",{style:"cursor:pointer;font-size:12px;color:var(--muted);margin-bottom:8px"},"More details (serial, VIN, notes)"),
       el("div",{class:"grid cols-3"},
@@ -772,6 +901,14 @@ function openAssetModal(id) {
         flash("Description, entity, cost, in-service date are required","err"); return;
       }
       const payload = Object.assign({}, a); delete payload.categories; delete payload.entities;
+      // Normalize empty optional fields → null so Postgres typed columns accept them.
+      if (payload.prior_through_date === "" || payload.prior_through_date == null) payload.prior_through_date = null;
+      if (!payload.prior_depreciation) payload.prior_depreciation = 0;
+      if (payload.property_type === "" || payload.property_type == null) payload.property_type = null;
+      // If the migration hasn't been run yet, drop these keys so Postgres doesn't reject the row.
+      if (!STATE.taxColsReady) {
+        delete payload.property_type; delete payload.prior_depreciation; delete payload.prior_through_date;
+      }
       if (!id) { payload.created_by = USER.email; }
       let saved;
       try { saved = await upsert("assets", payload); }
@@ -1315,7 +1452,7 @@ VIEWS.entities = function(root) {
   const rows = STATE.entities.map(e => {
     const assetCount = STATE.assets.filter(a=>a.entity_id===e.id && a.status==="active").length;
     const link = el("a",{href:"#",style:"color:var(--maroon);text-decoration:none;font-weight:600;cursor:pointer"}, e.name);
-    link.onclick = (ev) => { ev.preventDefault(); show("assets",{entity_id: e.id, status:""}); };
+    link.onclick = (ev) => { ev.preventDefault(); show("entity", {id: e.id}); };
     return [
     link,
     e.parent_group || "—",
@@ -1332,6 +1469,115 @@ VIEWS.entities = function(root) {
   ];});
   root.appendChild(card(null, tableEl(["Name","Group","Type","Ownership",{label:"Active assets",class:"num"},"Actions"], rows)));
 };
+
+// ============================================================
+// VIEW: Entity (property) detail — landing page for one entity
+// ============================================================
+VIEWS.entity = function(root, ctx) {
+  const id = ctx && ctx.id;
+  const e = byId(STATE.entities, id);
+  if (!e) { root.appendChild(el("p",{}, "Entity not found.")); return; }
+
+  const y = thisYear();
+  const all = STATE.assets.filter(a => a.entity_id === e.id);
+  const active = all.filter(a => a.status === "active");
+  const disposed = all.filter(a => a.status === "disposed");
+  const tot = Depreciation.yearTotals(active, y);
+
+  // Header + back link
+  root.appendChild(el("div",{style:"margin-bottom:10px"},
+    el("a",{href:"#",style:"color:var(--maroon);text-decoration:none",
+      onclick:ev=>{ev.preventDefault(); show("entities");}}, "← Back to entities")
+  ));
+  root.appendChild(el("h2",{}, e.name, " ",
+    el("small",{},(e.entity_type||"")+(e.parent_group?" · "+e.parent_group:""))));
+  root.appendChild(el("div",{class:"small",style:"margin-bottom:14px"},
+    [e.tax_id, e.address, e.notes, e.ownership_pct!=null?(e.ownership_pct+"% owned"):null]
+      .filter(Boolean).join(" · ") || ""));
+
+  // KPI row
+  root.appendChild(el("div",{class:"kpi-row"},
+    kpi("Active assets", String(active.length), all.length===active.length ? null : (all.length-active.length)+" disposed"),
+    kpi("Total cost", fmt$(tot.cost), null),
+    kpi("Accumulated dep.", fmt$(tot.accumulated), "thru EOY "+(y-1)+" + "+y+" YTD"),
+    kpi("Net book value", fmt$(tot.nbv), null),
+    kpi(y+" depreciation", fmt$(tot.depreciation), null),
+  ));
+
+  // Action buttons
+  root.appendChild(el("div",{style:"margin:10px 0 16px"},
+    el("button",{class:"btn",onclick:()=>openAssetModal(null, {entity_id: e.id})}, "+ Add asset to this entity"),
+    " ",
+    el("button",{class:"btn ghost",onclick:()=>editEntity(e.id)}, "Edit entity"),
+  ));
+
+  // Active assets table
+  if (active.length) {
+    const rows = active.map(a => {
+      const c = byId(STATE.categories, a.category_id);
+      const sched = Depreciation.schedule(a, y).find(r=>r.year===y);
+      const yDep = sched ? sched.total_expense : 0;
+      const nbv = sched ? sched.closing_nbv : (+a.cost||0);
+      const link = el("a",{href:"#",style:"color:var(--maroon);text-decoration:none;font-weight:600;cursor:pointer"},
+        a.description + (a.asset_number ? " ("+a.asset_number+")" : ""));
+      link.onclick = (ev)=>{ ev.preventDefault(); show("asset",{id:a.id}); };
+      return [link, c?c.name:"—", fmtDate(a.in_service_date),
+        {class:"num",value:fmt$(a.cost)},
+        {class:"num",value:fmt$(yDep)},
+        {class:"num",value:fmt$(nbv)},
+        a.location||""];
+    });
+    root.appendChild(card("Active assets — "+active.length,
+      tableEl(["Asset","Category","In service",
+        {label:"Cost",class:"num"},{label:y+" dep.",class:"num"},{label:"NBV",class:"num"},
+        "Location"], rows)));
+  } else {
+    root.appendChild(card("Active assets", el("p",{class:"small"},"No active assets under this entity yet.")));
+  }
+
+  // Recent transfers in/out
+  const involvedTransfers = STATE.transfers.filter(t =>
+    t.from_entity_id === e.id || t.to_entity_id === e.id);
+  if (involvedTransfers.length) {
+    const rows = involvedTransfers.slice(0, 25).map(t => {
+      const a = byId(STATE.assets, t.asset_id);
+      const fromE = byId(STATE.entities, t.from_entity_id);
+      const toE = byId(STATE.entities, t.to_entity_id);
+      const direction = t.from_entity_id === e.id ? "→ out" : "← in";
+      return [fmtDate(t.transfer_date), a?a.description:"—",
+        direction, fromE?fromE.name:"—", toE?toE.name:"—", t.reason||""];
+    });
+    root.appendChild(card("Transfers — "+involvedTransfers.length,
+      tableEl(["Date","Asset","Direction","From","To","Reason"], rows)));
+  }
+
+  // Disposals from this entity
+  if (disposed.length) {
+    const rows = disposed.map(a => {
+      const d = STATE.disposals.find(x => x.asset_id === a.id);
+      if (!d) return null;
+      const a2 = Object.assign({}, a, { disposal_date: d.disposal_date });
+      const sched = Depreciation.schedule(a2);
+      const last = sched[sched.length-1];
+      const acc = last ? last.accumulated : 0;
+      const basis = (+a.cost||0) - acc;
+      const gl = (+d.proceeds||0) - basis;
+      const link = el("a",{href:"#",style:"color:var(--maroon);text-decoration:none;cursor:pointer"},
+        a.description);
+      link.onclick = (ev)=>{ ev.preventDefault(); show("asset",{id:a.id}); };
+      return [fmtDate(d.disposal_date), link, d.disposal_type||"",
+        {class:"num",value:fmt$(a.cost)},
+        {class:"num",value:fmt$(d.proceeds||0)},
+        {class:"num",value:fmt$(gl)}];
+    }).filter(Boolean);
+    if (rows.length) {
+      root.appendChild(card("Disposed assets — "+rows.length,
+        tableEl(["Date","Asset","Type",{label:"Cost",class:"num"},
+          {label:"Proceeds",class:"num"},{label:"Gain/(Loss)",class:"num"}], rows)));
+    }
+  }
+};
+
 function editEntity(id) {
   const e = id ? Object.assign({}, byId(STATE.entities, id)) : { name:"", parent_group:"", entity_type:"operating", ownership_pct:100, active:true };
   modal({ title: id?"Edit entity":"Add entity",
@@ -1373,7 +1619,7 @@ VIEWS.categories = function(root) {
   root.appendChild(card(null, tableEl(["Name","Default method","Life","Convention","Actions"], rows)));
 };
 function editCategory(id) {
-  const c = id ? Object.assign({}, byId(STATE.categories, id)) : { name:"", default_method:"ddb", default_life_years:5, default_convention:"half_year", color:"#8b1a1a", sort_order:100 };
+  const c = id ? Object.assign({}, byId(STATE.categories, id)) : { name:"", default_method:"ddb", default_life_years:5, default_convention:"half_year", property_type:"1245", color:"#8b1a1a", sort_order:100 };
   modal({ title: id?"Edit category":"Add category",
     body: el("div",{class:"grid"},
       field("Name *", el("input",{type:"text",value:c.name||"",oninput:e=>c.name=e.target.value})),
@@ -1382,12 +1628,20 @@ function editCategory(id) {
         field("Default life (yrs)", el("input",{type:"number",step:"0.5",value:c.default_life_years||5,oninput:e=>c.default_life_years=+e.target.value||0})),
         field("Default convention", (()=>{const s=el("select",{onchange:e=>c.default_convention=e.target.value}); [["half_year","Half-Year"],["mid_quarter","Mid-Quarter"],["mid_month","Mid-Month"]].forEach(([v,l])=>s.appendChild(el("option",{value:v},l))); s.value=c.default_convention||"half_year"; return s;})()),
       ),
+      STATE.taxColsReady ? field("Tax property type (Form 4797)", (()=>{
+        const s=el("select",{onchange:e=>c.property_type=e.target.value});
+        Object.entries(PROP_TYPE_LABELS).forEach(([v,l])=>s.appendChild(el("option",{value:v},l)));
+        s.value=c.property_type||"1245"; return s;
+      })()) : null,
       field("Color", el("input",{type:"color",value:c.color||"#8b1a1a",oninput:e=>c.color=e.target.value})),
       field("Sort order", el("input",{type:"number",value:c.sort_order||100,oninput:e=>c.sort_order=+e.target.value||0}))
     ),
     onSave: async() => {
       if (!c.name) throw new Error("Name required");
-      await upsert("categories", c); await refreshAll(); show("categories"); flash("Saved");
+      if (!c.property_type) c.property_type = "1245";
+      const payload = Object.assign({}, c);
+      if (!STATE.taxColsReady) delete payload.property_type;
+      await upsert("categories", payload); await refreshAll(); show("categories"); flash("Saved");
     }
   });
 }
@@ -1407,6 +1661,7 @@ VIEWS.reports = function(root) {
   }
 
   root.appendChild(el("h2",{},"Reports"));
+  if (!STATE.taxColsReady) root.appendChild(migrationBanner());
   // Build custom-date field first so we can toggle it from the As-of select
   const customDateField = field("Custom date", el("input",{type:"date",value:st.customDate,oninput:e=>{st.customDate=e.target.value; render();}}));
   customDateField.style.display = (st.asOfMode==="custom") ? "block":"none";
@@ -1415,7 +1670,14 @@ VIEWS.reports = function(root) {
     el("div",{class:"bd"},
       el("div",{class:"row-bar"},
         field("Report", (()=>{const s=el("select",{onchange:e=>{st.type=e.target.value; render();}});
-          [["rollforward","Asset Roll-forward"],["schedule","Depreciation schedule (by asset)"],["disposals","Disposal report"],["inventory","Current inventory"],["by_entity","Summary by entity"],["by_category","Summary by category"]]
+          [["rollforward","Asset Roll-forward"],
+           ["schedule","Depreciation schedule (by asset)"],
+           ["disposals","Disposal report"],
+           ["form4797","Form 4797 — Sales of business property"],
+           ["form4562","Form 4562 — Depreciation & §179"],
+           ["inventory","Current inventory"],
+           ["by_entity","Summary by entity"],
+           ["by_category","Summary by category"]]
           .forEach(([v,l])=>s.appendChild(el("option",{value:v},l))); s.value=st.type; return s;})()),
         field("Tax year", el("input",{type:"number",value:st.year,style:"width:100px",oninput:e=>{st.year=+e.target.value||thisYear(); render();}})),
         field("As of", (()=>{const s=el("select",{onchange:e=>{st.asOfMode=e.target.value; customDateField.style.display=(st.asOfMode==="custom")?"block":"none"; render();}});
@@ -1439,6 +1701,8 @@ VIEWS.reports = function(root) {
     if (st.type === "rollforward")      out.appendChild(renderRollforward(st.year, r=>lastCsv=r));
     else if (st.type === "schedule")    out.appendChild(renderScheduleReport(st.year, r=>lastCsv=r, asOf));
     else if (st.type === "disposals")   out.appendChild(renderDisposalReport(st.year, r=>lastCsv=r));
+    else if (st.type === "form4797")    out.appendChild(renderForm4797(st.year, r=>lastCsv=r));
+    else if (st.type === "form4562")    out.appendChild(renderForm4562(st.year, r=>lastCsv=r));
     else if (st.type === "inventory")   out.appendChild(renderInventoryReport(r=>lastCsv=r));
     else if (st.type === "by_entity")   out.appendChild(renderSummaryByEntity(st.year, r=>lastCsv=r));
     else if (st.type === "by_category") out.appendChild(renderSummaryByCategory(st.year, r=>lastCsv=r));
@@ -1593,6 +1857,292 @@ function renderDisposalReport(year, setCsv) {
     } return c; }))});
   return card("Disposal report — "+year, tableEl(headers.map((h,i)=>[4,5,6,7,8].includes(i)?{label:h,class:"num"}:h), rows));
 }
+
+// ---------- Form 4797: Sales of Business Property ----------
+// For each asset disposed in `year`, computes §1245 ordinary recapture and the
+// remaining §1231 gain (long-term capital). §1250 real property currently
+// reports 0 ordinary recapture (most post-1986 SL-depreciated property has no
+// "additional depreciation"); the CPA can flag exceptions per asset.
+function renderForm4797(year, setCsv) {
+  const list = STATE.disposals
+    .filter(d => new Date(d.disposal_date).getFullYear() === year)
+    .map(d => ({ d, a: byId(STATE.assets, d.asset_id) }))
+    .filter(x => x.a)
+    .sort((x,y) => new Date(x.d.disposal_date) - new Date(y.d.disposal_date));
+
+  const rows1245 = [], rows1250 = [], rowsOther = [];
+  const T = { proceeds:0, cost:0, accum:0, basis:0, gl:0, sec1245:0, sec1231:0 };
+
+  list.forEach(({d, a}) => {
+    const a2 = Object.assign({}, a, { disposal_date: d.disposal_date });
+    const sched = Depreciation.schedule(a2);
+    const last = sched[sched.length - 1];
+    const accum = last ? last.accumulated : 0;
+    const cost = +a.cost || 0;
+    const proceeds = +d.proceeds || 0;
+    const basis = cost - accum;
+    const gl = proceeds - basis;
+
+    const ptype = effectivePropertyType(a);
+    let sec1245 = 0, sec1231 = 0;
+    if (gl <= 0) {
+      // Loss: all §1231
+      sec1231 = gl;
+    } else if (ptype === "1245") {
+      sec1245 = Math.min(gl, accum);
+      sec1231 = gl - sec1245;
+    } else if (ptype === "1250") {
+      // Simplification: post-1986 SL real property → no additional depreciation.
+      sec1245 = 0;
+      sec1231 = gl;
+    } else {
+      // 'none' — treat as full §1231 gain.
+      sec1231 = gl;
+    }
+
+    const e = byId(STATE.entities, a.entity_id);
+    const row = {
+      desc: a.description + (a.asset_number ? " ("+a.asset_number+")" : ""),
+      acq: fmtDate(a.in_service_date),
+      sold: fmtDate(d.disposal_date),
+      proceeds, cost, accum, basis, gl, sec1245, sec1231,
+      ptype: PROP_TYPE_LABELS[ptype] || ptype,
+      entity: e ? e.name : "—",
+    };
+    (ptype === "1245" ? rows1245 : ptype === "1250" ? rows1250 : rowsOther).push(row);
+    T.proceeds+=proceeds; T.cost+=cost; T.accum+=accum; T.basis+=basis;
+    T.gl+=gl; T.sec1245+=sec1245; T.sec1231+=sec1231;
+  });
+
+  const headers = ["Description","Date acquired","Date sold","Property type","Entity",
+    "Proceeds","Cost basis","Accum. dep.","Tax basis","Total gain/(loss)",
+    "§1245 ordinary","§1231 gain"];
+
+  const csvRows = [];
+  const sections = [];
+
+  function buildSection(title, rows) {
+    if (!rows.length) return null;
+    const sub = { proceeds:0, cost:0, accum:0, basis:0, gl:0, sec1245:0, sec1231:0 };
+    const rowEls = rows.map(r => {
+      sub.proceeds+=r.proceeds; sub.cost+=r.cost; sub.accum+=r.accum;
+      sub.basis+=r.basis; sub.gl+=r.gl; sub.sec1245+=r.sec1245; sub.sec1231+=r.sec1231;
+      csvRows.push([r.desc, r.acq, r.sold, r.ptype, r.entity,
+        r.proceeds.toFixed(2), r.cost.toFixed(2), r.accum.toFixed(2), r.basis.toFixed(2),
+        r.gl.toFixed(2), r.sec1245.toFixed(2), r.sec1231.toFixed(2)]);
+      return [r.desc, r.acq, r.sold, r.ptype, r.entity,
+        {class:"num",value:fmt$(r.proceeds)},{class:"num",value:fmt$(r.cost)},
+        {class:"num",value:fmt$(r.accum)},{class:"num",value:fmt$(r.basis)},
+        {class:"num",value:fmt$(r.gl)},
+        {class:"num",value:fmt$(r.sec1245)},{class:"num",value:fmt$(r.sec1231)}];
+    });
+    rowEls.push([el("b",{},"Subtotal — "+title), "","","","",
+      {class:"num",value:el("b",{},fmt$(sub.proceeds))},{class:"num",value:el("b",{},fmt$(sub.cost))},
+      {class:"num",value:el("b",{},fmt$(sub.accum))},{class:"num",value:el("b",{},fmt$(sub.basis))},
+      {class:"num",value:el("b",{},fmt$(sub.gl))},
+      {class:"num",value:el("b",{},fmt$(sub.sec1245))},{class:"num",value:el("b",{},fmt$(sub.sec1231))}]);
+    csvRows.push(["Subtotal — "+title, "","","","",
+      sub.proceeds.toFixed(2), sub.cost.toFixed(2), sub.accum.toFixed(2), sub.basis.toFixed(2),
+      sub.gl.toFixed(2), sub.sec1245.toFixed(2), sub.sec1231.toFixed(2)]);
+    return card(title, tableEl(
+      headers.map((h,i)=>i>=5?{label:h,class:"num"}:h), rowEls));
+  }
+
+  const s1 = buildSection("§1245 — Personal property", rows1245);
+  const s2 = buildSection("§1250 — Real property", rows1250);
+  const s3 = buildSection("Other / non-recapture", rowsOther);
+
+  const summary = card("Form 4797 totals — "+year, tableEl(
+    ["", {label:"Proceeds",class:"num"},{label:"Cost basis",class:"num"},
+     {label:"Accum. dep.",class:"num"},{label:"Tax basis",class:"num"},
+     {label:"Total gain/(loss)",class:"num"},
+     {label:"§1245 ordinary (Part III)",class:"num"},
+     {label:"§1231 gain (Part I)",class:"num"}],
+    [["TOTAL",
+      {class:"num",value:fmt$(T.proceeds)},{class:"num",value:fmt$(T.cost)},
+      {class:"num",value:fmt$(T.accum)},{class:"num",value:fmt$(T.basis)},
+      {class:"num",value:fmt$(T.gl)},
+      {class:"num",value:fmt$(T.sec1245)},{class:"num",value:fmt$(T.sec1231)}]]
+  ));
+  csvRows.push([]);
+  csvRows.push(["TOTAL","","","","",
+    T.proceeds.toFixed(2), T.cost.toFixed(2), T.accum.toFixed(2), T.basis.toFixed(2),
+    T.gl.toFixed(2), T.sec1245.toFixed(2), T.sec1231.toFixed(2)]);
+
+  setCsv({filename:"form_4797_"+year+".csv", headers, rows: csvRows});
+
+  const wrap = el("div",{});
+  wrap.appendChild(summary);
+  if (!list.length) {
+    wrap.appendChild(card(null, el("p",{class:"small"},"No disposals in "+year+".")));
+  }
+  if (s1) wrap.appendChild(s1);
+  if (s2) wrap.appendChild(s2);
+  if (s3) wrap.appendChild(s3);
+  return wrap;
+}
+
+// ---------- Form 4562: Depreciation & Amortization ----------
+// Current-year acquisitions broken out by class life (3/5/7/10/15/20/25/27.5/39/Other),
+// plus a single line for "other depreciation" (assets in service before this year).
+// Includes total §179, total bonus, and grand-total expense, plus per-entity rollup.
+function renderForm4562(year, setCsv) {
+  const CLASS_LIVES = [3, 5, 7, 10, 15, 20, 25, 27.5, 39];
+  const classLifeBucket = (life) => {
+    const L = +life || 0;
+    for (const cl of CLASS_LIVES) if (Math.abs(L - cl) < 0.01) return String(cl);
+    return "Other";
+  };
+
+  // Active-or-disposed-in-year assets that have been placed in service on/before this year.
+  const list = STATE.assets
+    .filter(a => yearOfStr(a.in_service_date) <= year);
+
+  // Compute per-asset current-year numbers using the same disposal-aware logic
+  // the rest of the app uses.
+  const enriched = list.map(a => {
+    const disp = STATE.disposals.find(d => d.asset_id === a.id);
+    const dispThisYr = disp && yearOfStr(disp.disposal_date) === year;
+    const effective = dispThisYr ? Object.assign({}, a, { disposal_date: disp.disposal_date }) : a;
+    const sched = Depreciation.schedule(effective, year);
+    const yr = sched.find(r => r.year === year) || null;
+    return {
+      a, yr,
+      inYr: yearOfStr(a.in_service_date),
+      cost: +a.cost || 0,
+      sec179: yr ? yr.sec179 : 0,
+      bonus: yr ? yr.bonus : 0,
+      reg: yr ? yr.depreciation : 0,
+      total: yr ? yr.total_expense : 0,
+    };
+  });
+
+  const current = enriched.filter(x => x.inYr === year);
+  const prior = enriched.filter(x => x.inYr < year);
+
+  // ---- Section 1: current-year acquisitions, by class life ----
+  const buckets = {};
+  CLASS_LIVES.forEach(cl => buckets[String(cl)] = { count:0, cost:0, sec179:0, bonus:0, reg:0, total:0 });
+  buckets["Other"] = { count:0, cost:0, sec179:0, bonus:0, reg:0, total:0 };
+
+  current.forEach(x => {
+    const k = classLifeBucket(x.a.life_years);
+    const b = buckets[k];
+    b.count++; b.cost+=x.cost; b.sec179+=x.sec179; b.bonus+=x.bonus; b.reg+=x.reg; b.total+=x.total;
+  });
+
+  const headers1 = ["Class life","# Assets","Cost","§179","Bonus","Regular dep.","Total expense"];
+  const rows1 = [];
+  const t1 = { count:0, cost:0, sec179:0, bonus:0, reg:0, total:0 };
+  ["3","5","7","10","15","20","25","27.5","39","Other"].forEach(k => {
+    const b = buckets[k];
+    if (b.count === 0) return;
+    rows1.push([k+(k==="Other"?"":"-year"),
+      String(b.count),
+      {class:"num",value:fmt$(b.cost)},{class:"num",value:fmt$(b.sec179)},
+      {class:"num",value:fmt$(b.bonus)},{class:"num",value:fmt$(b.reg)},
+      {class:"num",value:fmt$(b.total)}]);
+    t1.count+=b.count; t1.cost+=b.cost; t1.sec179+=b.sec179;
+    t1.bonus+=b.bonus; t1.reg+=b.reg; t1.total+=b.total;
+  });
+  rows1.push([el("b",{},"Subtotal — current year"), el("b",{},String(t1.count)),
+    {class:"num",value:el("b",{},fmt$(t1.cost))},{class:"num",value:el("b",{},fmt$(t1.sec179))},
+    {class:"num",value:el("b",{},fmt$(t1.bonus))},{class:"num",value:el("b",{},fmt$(t1.reg))},
+    {class:"num",value:el("b",{},fmt$(t1.total))}]);
+
+  // ---- Section 2: prior-year assets (single "other depreciation" line) ----
+  const t2 = { count:0, cost:0, sec179:0, bonus:0, reg:0, total:0 };
+  prior.forEach(x => {
+    if (x.total === 0) return;
+    t2.count++; t2.cost+=x.cost; t2.sec179+=x.sec179;
+    t2.bonus+=x.bonus; t2.reg+=x.reg; t2.total+=x.total;
+  });
+  const rows2 = [["Other depreciation (prior-year assets, line 17)",
+    String(t2.count),
+    {class:"num",value:fmt$(t2.cost)},{class:"num",value:fmt$(t2.sec179)},
+    {class:"num",value:fmt$(t2.bonus)},{class:"num",value:fmt$(t2.reg)},
+    {class:"num",value:fmt$(t2.total)}]];
+
+  // ---- Section 3: per-entity rollup ----
+  const ents = {};
+  enriched.forEach(x => {
+    const eName = (byId(STATE.entities, x.a.entity_id)||{}).name || "Unassigned";
+    const e = ents[eName] = ents[eName] || { count:0, cost:0, sec179:0, bonus:0, reg:0, total:0 };
+    e.count++; e.cost+=x.cost; e.sec179+=x.sec179;
+    e.bonus+=x.bonus; e.reg+=x.reg; e.total+=x.total;
+  });
+  const headers3 = ["Entity","# Assets","Cost","§179","Bonus","Regular dep.","Total expense"];
+  const rows3 = [];
+  const t3 = { count:0, cost:0, sec179:0, bonus:0, reg:0, total:0 };
+  Object.keys(ents).sort().forEach(k => {
+    const b = ents[k];
+    rows3.push([k, String(b.count),
+      {class:"num",value:fmt$(b.cost)},{class:"num",value:fmt$(b.sec179)},
+      {class:"num",value:fmt$(b.bonus)},{class:"num",value:fmt$(b.reg)},
+      {class:"num",value:fmt$(b.total)}]);
+    t3.count+=b.count; t3.cost+=b.cost; t3.sec179+=b.sec179;
+    t3.bonus+=b.bonus; t3.reg+=b.reg; t3.total+=b.total;
+  });
+  rows3.push([el("b",{},"TOTAL"), el("b",{},String(t3.count)),
+    {class:"num",value:el("b",{},fmt$(t3.cost))},{class:"num",value:el("b",{},fmt$(t3.sec179))},
+    {class:"num",value:el("b",{},fmt$(t3.bonus))},{class:"num",value:el("b",{},fmt$(t3.reg))},
+    {class:"num",value:el("b",{},fmt$(t3.total))}]);
+
+  // ---- Grand summary card ----
+  const grand = { sec179: t1.sec179+t2.sec179, bonus: t1.bonus+t2.bonus,
+                  reg: t1.reg+t2.reg, total: t1.total+t2.total };
+  const summary = card("Form 4562 totals — "+year, tableEl(
+    [{label:"§179",class:"num"},{label:"Bonus depreciation",class:"num"},
+     {label:"Regular MACRS",class:"num"},{label:"Total expense",class:"num"}],
+    [[{class:"num",value:el("b",{},fmt$(grand.sec179))},
+      {class:"num",value:el("b",{},fmt$(grand.bonus))},
+      {class:"num",value:el("b",{},fmt$(grand.reg))},
+      {class:"num",value:el("b",{},fmt$(grand.total))}]]
+  ));
+
+  // ---- CSV ----
+  const csvHeaders = ["Section","Bucket","# Assets","Cost","§179","Bonus","Regular dep.","Total expense"];
+  const csvRows = [];
+  ["3","5","7","10","15","20","25","27.5","39","Other"].forEach(k => {
+    const b = buckets[k]; if (b.count === 0) return;
+    csvRows.push(["Current-year acquisitions", k+(k==="Other"?"":"-year"), b.count,
+      b.cost.toFixed(2), b.sec179.toFixed(2), b.bonus.toFixed(2),
+      b.reg.toFixed(2), b.total.toFixed(2)]);
+  });
+  csvRows.push(["Current-year acquisitions","Subtotal", t1.count,
+    t1.cost.toFixed(2), t1.sec179.toFixed(2), t1.bonus.toFixed(2), t1.reg.toFixed(2), t1.total.toFixed(2)]);
+  csvRows.push(["Prior-year assets","Other depreciation (line 17)", t2.count,
+    t2.cost.toFixed(2), t2.sec179.toFixed(2), t2.bonus.toFixed(2), t2.reg.toFixed(2), t2.total.toFixed(2)]);
+  csvRows.push([]);
+  csvRows.push(["By entity","",""]);
+  Object.keys(ents).sort().forEach(k => {
+    const b = ents[k];
+    csvRows.push(["By entity", k, b.count,
+      b.cost.toFixed(2), b.sec179.toFixed(2), b.bonus.toFixed(2), b.reg.toFixed(2), b.total.toFixed(2)]);
+  });
+  csvRows.push(["By entity","TOTAL", t3.count,
+    t3.cost.toFixed(2), t3.sec179.toFixed(2), t3.bonus.toFixed(2), t3.reg.toFixed(2), t3.total.toFixed(2)]);
+  csvRows.push([]);
+  csvRows.push(["Grand totals","",""]);
+  csvRows.push(["Grand totals","§179","",grand.sec179.toFixed(2)]);
+  csvRows.push(["Grand totals","Bonus","",grand.bonus.toFixed(2)]);
+  csvRows.push(["Grand totals","Regular MACRS","",grand.reg.toFixed(2)]);
+  csvRows.push(["Grand totals","Total expense","",grand.total.toFixed(2)]);
+  setCsv({filename:"form_4562_"+year+".csv", headers: csvHeaders, rows: csvRows});
+
+  const wrap = el("div",{});
+  wrap.appendChild(summary);
+  wrap.appendChild(card("Current-year acquisitions by class life — "+year,
+    tableEl(headers1.map((h,i)=>i>=2?{label:h,class:"num"}:h), rows1)));
+  wrap.appendChild(card("Prior-year assets (other depreciation) — "+year,
+    tableEl(headers1.map((h,i)=>i>=2?{label:h,class:"num"}:h), rows2)));
+  wrap.appendChild(card("By entity — "+year,
+    tableEl(headers3.map((h,i)=>i>=1?{label:h,class:"num"}:h), rows3)));
+  return wrap;
+}
+
+// Robust year-from-date helper for the Form 4562 report (UTC-safe).
+function yearOfStr(s) { return s ? new Date(s).getUTCFullYear() : 0; }
 
 function renderInventoryReport(setCsv) {
   const list = STATE.assets.filter(a => a.status === "active");
