@@ -54,3 +54,26 @@ union all
 select 'assets marked disposed', count(*) from assets where status='disposed'
 union all
 select 'orphan active-with-disposal', count(*) from assets a where a.status='active' and exists (select 1 from disposals d where d.asset_id=a.id);
+
+-- ========================================================
+-- 6) Tax-form support: property_type + prior depreciation
+-- ========================================================
+-- '1245' = personal property (equipment, vehicles, AG fences) — full depreciation recapture as ordinary income
+-- '1250' = real property (buildings, residential rental) — only "additional depreciation" recaptured
+-- 'none' = land or other non-depreciable / non-recapture property
+alter table categories
+  add column if not exists property_type text default '1245'
+  check (property_type in ('1245','1250','none'));
+
+alter table assets
+  add column if not exists property_type text
+  check (property_type in ('1245','1250','none'));
+
+-- Prior depreciation: for assets imported mid-life from another system
+-- (e.g. Ranch Management). prior_depreciation is the accumulated total
+-- already booked elsewhere; prior_through_date is the last day that prior
+-- accumulation covers. The engine resumes booking AFTER that date.
+alter table assets
+  add column if not exists prior_depreciation numeric(14,2) default 0;
+alter table assets
+  add column if not exists prior_through_date date;
