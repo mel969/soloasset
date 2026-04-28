@@ -311,8 +311,29 @@
 let sb = null;                 // supabase client
 let USER = null;               // { email, role, id }
 let STATE = {
-  entities: [], categories: [], assets: [], transfers: [], disposals: [], allowed: []
+  entities: [], categories: [], assets: [], transfers: [], disposals: [], allowed: [],
+  // taxColsReady becomes true once the migration.sql §6 block has been run
+  // (adds property_type / prior_depreciation / prior_through_date). While
+  // false, the new tax-form UI fields are hidden and stripped from saves so
+  // the app keeps working without the migration.
+  taxColsReady: true
 };
+
+const MIGRATION_SQL = [
+  "alter table categories",
+  "  add column if not exists property_type text default '1245'",
+  "  check (property_type in ('1245','1250','none'));",
+  "",
+  "alter table assets",
+  "  add column if not exists property_type text",
+  "  check (property_type in ('1245','1250','none'));",
+  "",
+  "alter table assets",
+  "  add column if not exists prior_depreciation numeric(14,2) default 0;",
+  "",
+  "alter table assets",
+  "  add column if not exists prior_through_date date;"
+].join("\n");
 
 // ------- helpers -------
 const $ = sel => document.querySelector(sel);
@@ -355,6 +376,29 @@ function effectivePropertyType(a) {
 }
 function effectivePropertyTypeLabel(a) {
   return PROP_TYPE_LABELS[effectivePropertyType(a)] || effectivePropertyType(a);
+}
+
+// Banner shown at the top of Reports (and elsewhere) when the tax-form
+// migration block hasn't been run yet. Surfaces the SQL to copy-paste and a
+// re-check button. Reports themselves still work via heuristic fallback.
+function migrationBanner() {
+  const sql = el("textarea",{readonly:true,style:"width:100%;height:140px;font-family:ui-monospace,Menlo,monospace;font-size:11px;background:#fff;border:1px solid var(--border);border-radius:4px;padding:8px;margin-top:6px"}, MIGRATION_SQL);
+  const wrap = el("div",{class:"card",style:"border-left:4px solid var(--warn,#c98a2b);margin-bottom:14px"},
+    el("div",{class:"bd"},
+      el("h3",{style:"margin:0 0 4px"}, "Database migration pending — tax form features partially active"),
+      el("p",{class:"small",style:"margin:0 0 8px"},
+        "Form 4797 and Form 4562 reports work using sensible defaults (any asset with life ≥ 27 yrs is treated as §1250 real property; everything else as §1245). To enable the per-asset property-type override, prior-depreciation handling, and the property-type column on categories, run this in Supabase Studio → SQL Editor:"),
+      sql,
+      el("div",{style:"margin-top:8px;display:flex;gap:6px"},
+        el("button",{class:"btn",onclick:async()=>{
+          try { await navigator.clipboard.writeText(MIGRATION_SQL); flash("SQL copied — paste into Studio SQL Editor"); }
+          catch(_){ sql.select(); document.execCommand("copy"); flash("SQL copied"); }
+        }},"Copy SQL"),
+        el("button",{class:"btn ghost",onclick:async()=>{ await refreshAll(); show("reports"); flash(STATE.taxColsReady?"Migration detected — features enabled":"Still pending","warn"); }},"I just ran it — re-check")
+      )
+    )
+  );
+  return wrap;
 }
 
 // ------- modal -------
@@ -450,6 +494,13 @@ async function refreshAll() {
     sb.from("disposals").select("*").order("disposal_date",{ascending:false}),
     sb.from("allowed_emails").select("*").order("email"),
   ]);
+  // Probe whether the tax-form columns from migration.sql §6 are present.
+  // We try selecting one of them; if Postgres errors with column-not-found
+  // (PGRST/42703), we hide the related UI and strip those keys on save.
+  try {
+    const probe = await sb.from("categories").select("property_type").limit(1);
+    STATE.taxColsReady = !probe.error;
+  } catch (_) { STATE.taxColsReady = false; }
   STATE.entities = ent.data || [];
   STATE.categories = cat.data || [];
   STATE.assets = as.data || [];
@@ -798,7 +849,7 @@ function openAssetModal(id, defaults) {
       field("Location", bindInput("location", el("input",{type:"text",value:a.location||""}))),
       field("Vendor",   bindInput("vendor", el("input",{type:"text",value:a.vendor||""}))),
     ),
-    el("div",{class:"grid cols-2"},
+    STATE.taxColsReady ? el("div",{class:"grid cols-2"},
       field("Tax property type (Form 4797)", (() => {
         const wrap = el("div",{});
         const s = el("select",{onchange: e=>{ a.property_type = e.target.value || null; f.propTypeHint.textContent = effectivePropertyTypeLabel(a); }});
@@ -818,7 +869,8 @@ function openAssetModal(id, defaults) {
         ),
         el("div",{class:"small",style:"color:var(--muted)"}, "Use when bringing in an asset that was already depreciating in another system (e.g. Ranch Management). The engine will resume booking after this date."),
       ),
-    ),
+    ) : el("div",{class:"msg warn",style:"font-size:12px"},
+      "Tax-form fields (property type, prior depreciation) are hidden until the database migration is run. Reports → Form 4797 / 4562 still work using sensible defaults."),
     el("details",{},
       el("summary",{style:"cursor:pointer;font-size:12px;color:var(--muted);margin-bottom:8px"},"More details (serial, VIN, notes)"),
       el("div",{class:"grid cols-3"},
@@ -853,6 +905,10 @@ function openAssetModal(id, defaults) {
       if (payload.prior_through_date === "" || payload.prior_through_date == null) payload.prior_through_date = null;
       if (!payload.prior_depreciation) payload.prior_depreciation = 0;
       if (payload.property_type === "" || payload.property_type == null) payload.property_type = null;
+      // If the migration hasn't been run yet, drop these keys so Postgres doesn't reject the row.
+      if (!STATE.taxColsReady) {
+        delete payload.property_type; delete payload.prior_depreciation; delete payload.prior_through_date;
+      }
       if (!id) { payload.created_by = USER.email; }
       let saved;
       try { saved = await upsert("assets", payload); }
@@ -1572,18 +1628,20 @@ function editCategory(id) {
         field("Default life (yrs)", el("input",{type:"number",step:"0.5",value:c.default_life_years||5,oninput:e=>c.default_life_years=+e.target.value||0})),
         field("Default convention", (()=>{const s=el("select",{onchange:e=>c.default_convention=e.target.value}); [["half_year","Half-Year"],["mid_quarter","Mid-Quarter"],["mid_month","Mid-Month"]].forEach(([v,l])=>s.appendChild(el("option",{value:v},l))); s.value=c.default_convention||"half_year"; return s;})()),
       ),
-      field("Tax property type (Form 4797)", (()=>{
+      STATE.taxColsReady ? field("Tax property type (Form 4797)", (()=>{
         const s=el("select",{onchange:e=>c.property_type=e.target.value});
         Object.entries(PROP_TYPE_LABELS).forEach(([v,l])=>s.appendChild(el("option",{value:v},l)));
         s.value=c.property_type||"1245"; return s;
-      })()),
+      })()) : null,
       field("Color", el("input",{type:"color",value:c.color||"#8b1a1a",oninput:e=>c.color=e.target.value})),
       field("Sort order", el("input",{type:"number",value:c.sort_order||100,oninput:e=>c.sort_order=+e.target.value||0}))
     ),
     onSave: async() => {
       if (!c.name) throw new Error("Name required");
       if (!c.property_type) c.property_type = "1245";
-      await upsert("categories", c); await refreshAll(); show("categories"); flash("Saved");
+      const payload = Object.assign({}, c);
+      if (!STATE.taxColsReady) delete payload.property_type;
+      await upsert("categories", payload); await refreshAll(); show("categories"); flash("Saved");
     }
   });
 }
@@ -1603,6 +1661,7 @@ VIEWS.reports = function(root) {
   }
 
   root.appendChild(el("h2",{},"Reports"));
+  if (!STATE.taxColsReady) root.appendChild(migrationBanner());
   // Build custom-date field first so we can toggle it from the As-of select
   const customDateField = field("Custom date", el("input",{type:"date",value:st.customDate,oninput:e=>{st.customDate=e.target.value; render();}}));
   customDateField.style.display = (st.asOfMode==="custom") ? "block":"none";
