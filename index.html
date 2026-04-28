@@ -581,8 +581,10 @@ async function remove(table, id) {
 const VIEWS = {};
 let _currentView = { name: "dashboard", ctx: {} };
 function show(name, ctx) {
-  // "asset" is a synthetic detail view — keep "assets" tab active for it.
-  const tabKey = (name === "asset") ? "assets" : name;
+  // Synthetic detail views — keep their list tab highlighted while showing detail.
+  const tabKey = (name === "asset") ? "assets"
+              : (name === "propertyDetail") ? "properties"
+              : name;
   $$("nav.side .tab").forEach(b => b.classList.toggle("active", b.dataset.view===tabKey));
   const v = $("#view");
   v.innerHTML = "";
@@ -911,12 +913,12 @@ function categorySelect({allowAll=false, value=null, onchange=null}={}) {
 }
 
 // ---------- Asset create/edit modal ----------
-function openAssetModal(id) {
-  const a = id ? Object.assign({}, byId(STATE.assets, id)) : {
+function openAssetModal(id, defaults) {
+  const a = id ? Object.assign({}, byId(STATE.assets, id)) : Object.assign({
     description:"", cost:0, salvage_value:0, in_service_date: todayISO(),
     method:"ddb", life_years:5, convention:"half_year", bonus_pct:0, section_179:0,
     status:"active"
-  };
+  }, defaults || {});
   const f = {};
   function refreshPreview() {
     const prev = f.preview;
@@ -3351,7 +3353,8 @@ VIEWS.properties = function(root) {
 
     parentRow.appendChild(tdText(caret, {style:"text-align:center;"}));
     parentRow.appendChild(tdText(el("div",{},
-      el("div",{style:"font-weight:600;color:#2e2520"}, pname),
+      el("a",{href:"#",style:"font-weight:600;color:var(--maroon);text-decoration:none;cursor:pointer",
+        onclick:(ev)=>{ev.preventDefault(); ev.stopPropagation(); show("propertyDetail",{name:pname});}}, pname),
       el("div",{style:"font-size:11px;color:var(--muted);font-weight:400;margin-top:2px"}, items.length+" sub-asset"+(items.length!==1?"s":""))
     )));
     parentRow.appendChild(tdNum(fmt$(land), {style:"font-weight:500"}));
@@ -3416,6 +3419,291 @@ VIEWS.properties = function(root) {
   });
   root.appendChild(el("div",{style:"border:1px solid var(--border);border-radius:6px;overflow:hidden;background:#fff"}, tbl));
 };
+
+// ============================================================
+// VIEW: Property detail — landing page for one property_group
+// Shows all sub-assets, KPIs, year-by-year depreciation rollup, and an
+// action to dispose of the whole property at once.
+// ============================================================
+VIEWS.propertyDetail = function(root, ctx) {
+  const pname = ctx && ctx.name;
+  if (!pname) { show("properties"); return; }
+
+  const items = STATE.assets.filter(a => a.pool_type === "property" && a.property_group === pname);
+  if (!items.length) {
+    root.appendChild(el("div",{style:"margin-bottom:10px"},
+      el("a",{href:"#",style:"color:var(--maroon);text-decoration:none",
+        onclick:ev=>{ev.preventDefault(); show("properties");}}, "← Back to properties")
+    ));
+    root.appendChild(el("h2",{}, pname));
+    root.appendChild(el("p",{class:"small"},"No sub-assets under this property name."));
+    return;
+  }
+
+  const y = thisYear();
+  const active = items.filter(a => a.status === "active");
+  const disposedItems = items.filter(a => a.status === "disposed");
+  const allDisposed = active.length === 0 && disposedItems.length > 0;
+
+  // Top-line totals
+  const land   = items.filter(a=>a.is_land).reduce((s,a)=>s+(+a.cost||0), 0);
+  const bldg   = items.filter(a=>!a.is_land).reduce((s,a)=>s+(+a.cost||0)+(+a.improvements_cost||0), 0);
+  const totalCost = land + bldg;
+  const yTot   = Depreciation.yearTotals(active.filter(a=>!a.is_land), y);
+  const nbv    = totalCost - yTot.accumulated;
+
+  // Entity (assume all sub-assets share an entity; pick the most common)
+  const entityCounts = {};
+  items.forEach(a => { const k = a.entity_id || ""; entityCounts[k] = (entityCounts[k]||0)+1; });
+  const entityId = Object.keys(entityCounts).sort((a,b)=>entityCounts[b]-entityCounts[a])[0];
+  const ent = entityId ? byId(STATE.entities, entityId) : null;
+
+  // Header
+  root.appendChild(el("div",{style:"margin-bottom:10px"},
+    el("a",{href:"#",style:"color:var(--maroon);text-decoration:none",
+      onclick:ev=>{ev.preventDefault(); show("properties");}}, "← Back to properties")
+  ));
+  root.appendChild(el("h2",{}, pname, " ",
+    allDisposed ? el("span",{class:"chip err"}, "DISPOSED") : null));
+  root.appendChild(el("div",{class:"small",style:"margin-bottom:14px"},
+    [ent?ent.name:null, items.length+" sub-asset"+(items.length!==1?"s":""),
+      land>0 ? fmt$(land)+" land" : null].filter(Boolean).join(" · ")));
+
+  // KPIs
+  root.appendChild(el("div",{class:"grid cols-5", style:"margin-bottom:14px"},
+    kpi("Sub-assets", String(items.length), active.length+" active"+(disposedItems.length?(" · "+disposedItems.length+" disposed"):"")),
+    kpi("Total cost", fmt$(totalCost), fmt$(land)+" land"),
+    kpi("Accum. depreciation", fmt$(yTot.accumulated), null),
+    kpi("Net book value", fmt$(nbv), null),
+    kpi(y+" depreciation", fmt$(yTot.depreciation), null),
+  ));
+
+  // Action buttons
+  root.appendChild(el("div",{style:"margin:0 0 16px;display:flex;gap:8px;flex-wrap:wrap"},
+    el("button",{class:"btn", onclick:()=>openPropertyModal(pname)}, "Edit property"),
+    el("button",{class:"btn", onclick:()=>openAssetModal(null, {pool_type:"property", property_group:pname, entity_id:entityId||null})}, "+ Add asset to property"),
+    !allDisposed ? el("button",{class:"btn danger", onclick:()=>openPropertyDisposeModal(pname)}, "Dispose entire property") : null,
+  ));
+
+  // Sub-assets table
+  const subHeaders = ["Asset","Category","In service","Cost","Prior accum","Accum dep",y+" dep","NBV","Status"];
+  const subRows = items
+    .sort((a,b)=> (a.is_land?0:1)-(b.is_land?0:1) || (a.description||"").localeCompare(b.description||""))
+    .map(sub => {
+      const cat = byId(STATE.categories, sub.category_id);
+      const sched = sub.is_land ? [] : Depreciation.schedule(sub, y);
+      const last = sched[sched.length-1];
+      const acc = last ? last.accumulated : (+sub.prior_accum_dep||0);
+      const cur = sched.find(r=>r.year===y);
+      const yExp = cur ? cur.total_expense : 0;
+      const subCost = (+sub.cost||0) + (+sub.improvements_cost||0);
+      const subNBV = subCost - acc;
+      const link = el("a",{href:"#",style:"color:var(--maroon);text-decoration:none;font-weight:500;cursor:pointer"},
+        sub.description || (cat?cat.name:"(no name)"));
+      link.onclick = (ev) => { ev.preventDefault(); show("asset",{id:sub.id}); };
+      return [link, cat?cat.name:"—", fmtDate(sub.in_service_date),
+        {class:"num",value:fmt$(subCost)},
+        {class:"num",value:fmt$(+sub.prior_accum_dep||0)},
+        {class:"num",value:fmt$(acc)},
+        {class:"num",value:fmt$(yExp)},
+        {class:"num",value:fmt$(subNBV)},
+        el("span",{class:"chip "+(sub.status==="active"?"ok":sub.status==="disposed"?"err":"warn")}, sub.status||"active")
+      ];
+    });
+  root.appendChild(card("Sub-assets",
+    tableEl(subHeaders.map((h,i)=>(i>=3 && i<=7)?{label:h,class:"num"}:h), subRows)));
+
+  // Year-by-year rollup across all non-land active sub-assets
+  const earliestYear = Math.min(...active.filter(a=>!a.is_land).map(a => new Date(a.in_service_date).getUTCFullYear()).filter(n=>!isNaN(n)));
+  if (isFinite(earliestYear)) {
+    const lastYear = y + 5; // show 5 years forward
+    const rollup = [];
+    let runAcc = 0;
+    for (let yr = earliestYear; yr <= lastYear; yr++) {
+      let yrDep = 0, yrCost = 0, yrCount = 0;
+      active.filter(a=>!a.is_land).forEach(a => {
+        const inY = new Date(a.in_service_date).getUTCFullYear();
+        if (inY > yr) return;
+        const sched = Depreciation.schedule(a, yr);
+        const r = sched.find(x => x.year === yr);
+        if (r) { yrDep += r.total_expense; yrCount++; }
+        yrCost += (+a.cost||0) + (+a.improvements_cost||0);
+      });
+      runAcc += yrDep;
+      const nbvAtEnd = yrCost - runAcc + land; // include land in NBV
+      rollup.push([String(yr),
+        String(yrCount),
+        {class:"num",value:fmt$(yrCost+land)},
+        {class:"num",value:fmt$(yrDep)},
+        {class:"num",value:fmt$(runAcc)},
+        {class:"num",value:fmt$(nbvAtEnd)},
+        yr === y ? el("span",{class:"chip ok",style:"margin-left:6px"}, "current") : ""
+      ]);
+    }
+    root.appendChild(card("Year-by-year depreciation rollup",
+      tableEl(["Year","# Active",
+        {label:"Total cost",class:"num"},
+        {label:"Year dep.",class:"num"},
+        {label:"Accumulated",class:"num"},
+        {label:"NBV (year-end)",class:"num"},
+        ""],
+      rollup)));
+  }
+
+  // If any disposals exist, show a summary
+  const dispsForProp = STATE.disposals.filter(d => items.some(a => a.id === d.asset_id));
+  if (dispsForProp.length) {
+    const dispHeaders = ["Date","Asset","Type","Cost","Proceeds","Gain/(Loss)"];
+    const dispRows = dispsForProp
+      .sort((a,b)=> new Date(b.disposal_date) - new Date(a.disposal_date))
+      .map(d => {
+        const a = byId(STATE.assets, d.asset_id);
+        if (!a) return null;
+        const a2 = Object.assign({}, a, { disposal_date: d.disposal_date });
+        const sched = Depreciation.schedule(a2);
+        const last = sched[sched.length-1];
+        const acc = last ? last.accumulated : (+a.prior_accum_dep||0);
+        const subCost = (+a.cost||0)+(+a.improvements_cost||0);
+        const basis = subCost - acc;
+        const gl = (+d.proceeds||0) - basis;
+        return [fmtDate(d.disposal_date), a.description, d.disposal_type||"",
+          {class:"num",value:fmt$(subCost)},
+          {class:"num",value:fmt$(d.proceeds||0)},
+          {class:"num",value:fmt$(gl)}];
+      })
+      .filter(Boolean);
+    if (dispRows.length) {
+      root.appendChild(card("Disposal history — "+dispRows.length+" record"+(dispRows.length!==1?"s":""),
+        tableEl(dispHeaders.map((h,i)=>i>=3?{label:h,class:"num"}:h), dispRows)));
+    }
+  }
+};
+
+// ============================================================
+// Dispose entire property — single transaction across all sub-assets.
+// Allocates total proceeds pro-rata across sub-assets by their tax basis
+// (cost + improvements − accumulated dep). Creates one disposal row per
+// sub-asset and marks each asset as disposed. Used when a property sells
+// as a whole.
+// ============================================================
+function openPropertyDisposeModal(pname) {
+  const items = STATE.assets.filter(a =>
+    a.pool_type === "property" && a.property_group === pname && a.status === "active"
+  );
+  if (!items.length) { flash("No active sub-assets to dispose","warn"); return; }
+
+  const rec = { disposal_date: todayISO(), disposal_type: "sold", proceeds: 0, buyer: "", notes: "" };
+
+  // Compute per-asset basis (NBV) for the allocation table
+  function bases() {
+    return items.map(a => {
+      if (a.is_land) {
+        return { id:a.id, desc:a.description, basis: +a.cost||0, isLand:true, accum:0 };
+      }
+      const sched = Depreciation.schedule(Object.assign({}, a, { disposal_date: rec.disposal_date }));
+      const last = sched[sched.length-1];
+      const acc = last ? last.accumulated : (+a.prior_accum_dep||0);
+      const cost = (+a.cost||0) + (+a.improvements_cost||0);
+      return { id:a.id, desc:a.description, basis: Math.max(cost - acc, 0), isLand:false, accum:acc, cost };
+    });
+  }
+
+  function refresh() {
+    const list = bases();
+    const totalBasis = list.reduce((s,x)=>s+x.basis, 0) || 1;
+    const totalProceeds = +rec.proceeds || 0;
+    preview.innerHTML = "";
+    const tot = { proceeds:0, basis:0, gl:0 };
+    const rows = list.map(x => {
+      // Pro-rata allocation by NBV; if total basis is 0, distribute equally.
+      const alloc = totalBasis > 0 ? totalProceeds * (x.basis / totalBasis) : totalProceeds / list.length;
+      const gl = alloc - x.basis;
+      tot.proceeds += alloc; tot.basis += x.basis; tot.gl += gl;
+      return [x.desc + (x.isLand?" (land)":""),
+        {class:"num",value:fmt$(x.basis)},
+        {class:"num",value:fmt$(alloc)},
+        {class:"num",value:fmt$(gl)}];
+    });
+    rows.push([el("b",{},"TOTAL"),
+      {class:"num",value:el("b",{},fmt$(tot.basis))},
+      {class:"num",value:el("b",{},fmt$(tot.proceeds))},
+      {class:"num",value:el("b",{},fmt$(tot.gl))}]);
+    preview.appendChild(tableEl(["Sub-asset",
+      {label:"Tax basis",class:"num"},
+      {label:"Allocated proceeds",class:"num"},
+      {label:"Gain/(Loss)",class:"num"}], rows));
+  }
+
+  const preview = el("div",{style:"margin-top:10px"});
+
+  modal({ title:"Dispose entire property — "+pname,
+    body: el("div",{class:"grid"},
+      el("div",{class:"msg warn"},
+        "This disposes of all "+items.length+" active sub-asset"+(items.length!==1?"s":"")+
+        " under "+pname+" in one go. Total proceeds are allocated pro-rata by each asset's tax basis (NBV). One disposal row is created per sub-asset."),
+      el("div",{class:"grid cols-2"},
+        field("Disposal date *", el("input",{type:"date",value:rec.disposal_date,
+          oninput:e=>{rec.disposal_date=e.target.value; refresh();}})),
+        field("Type", (()=>{const s=el("select",{onchange:e=>rec.disposal_type=e.target.value});
+          ["sold","scrapped","traded","lost","other"].forEach(t=>s.appendChild(el("option",{value:t},t)));
+          s.value="sold"; return s;})()),
+      ),
+      el("div",{class:"grid cols-2"},
+        field("Total proceeds *", el("input",{type:"number",step:"0.01",min:"0",value:0,
+          oninput:e=>{rec.proceeds=+e.target.value||0; refresh();}})),
+        field("Buyer", el("input",{type:"text",oninput:e=>rec.buyer=e.target.value})),
+      ),
+      field("Notes", el("textarea",{oninput:e=>rec.notes=e.target.value})),
+      el("h3",{style:"margin:10px 0 2px;font-size:13px"},"Per-asset allocation preview"),
+      preview
+    ),
+    saveLabel:"Record disposal of property",
+    onSave: async () => {
+      if (!rec.disposal_date) throw new Error("Pick a disposal date");
+      if (!(+rec.proceeds >= 0)) throw new Error("Total proceeds must be a number");
+
+      // Re-check server state to avoid double-disposing.
+      const ids = items.map(a=>a.id);
+      const { data: latest } = await sb.from("assets").select("id,status").in("id", ids);
+      const stillActive = (latest||[]).filter(r => r.status === "active").map(r=>r.id);
+      if (!stillActive.length) throw new Error("All sub-assets already disposed. Refresh the page.");
+
+      const list = bases();
+      const totalBasis = list.reduce((s,x)=>s+x.basis, 0) || 1;
+      const totalProceeds = +rec.proceeds || 0;
+
+      // Build the per-asset disposal payloads, only for assets still active server-side.
+      const disposals = list
+        .filter(x => stillActive.includes(x.id))
+        .map(x => ({
+          asset_id: x.id,
+          disposal_date: rec.disposal_date,
+          disposal_type: rec.disposal_type,
+          proceeds: r2(totalBasis > 0 ? totalProceeds * (x.basis / totalBasis) : totalProceeds / list.length),
+          buyer: rec.buyer || null,
+          notes: ("Property-level disposal of \""+pname+"\". " + (rec.notes||"")).trim(),
+          created_by: USER ? USER.email : null,
+        }));
+
+      const { error: dErr } = await sb.from("disposals").insert(disposals);
+      if (dErr) throw dErr;
+      const { error: uErr } = await sb.from("assets")
+        .update({ status:"disposed", updated_at: new Date().toISOString() })
+        .in("id", stillActive);
+      if (uErr) throw uErr;
+
+      await logActivity("property", null, "dispose_property",
+        "Disposed property \""+pname+"\" — "+disposals.length+" sub-asset"+(disposals.length!==1?"s":"")+
+        ", total proceeds "+fmt$(totalProceeds), { property_group: pname, count: disposals.length });
+
+      await refreshAll();
+      show("propertyDetail",{name:pname});
+      flash("Property disposed — "+disposals.length+" sub-asset disposal record"+(disposals.length!==1?"s":"")+" created");
+    }
+  });
+
+  refresh();
+}
 
 // ============================================================
 // Property add/edit modal — creates multiple asset rows in one go
