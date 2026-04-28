@@ -1,0 +1,19 @@
+{
+  "name": "soloasset",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "test:engine": "node --test test/engine.test.mjs",
+    "test:recapture": "node --test test/recapture.test.mjs",
+    "test:property": "node --test test/property-type.test.mjs",
+    "test:schema": "node --test test/schema-guard.test.mjs",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
+    "test:all": "npm run test && npm run test:e2e"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.48.0"
+  }
+}
