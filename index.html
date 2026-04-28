@@ -277,8 +277,35 @@
     });
     return {cost:r2(cost),depreciation:r2(dep),accumulated:r2(acc),nbv:r2(nbv),count};
   }
-  global.Depreciation = { schedule, yearTotals, firstYearFraction, disposalYearFraction };
-})(window);
+  // ---- Form 4797 helper: §1245 / §1231 recapture split for a disposal ----
+  // §1245 personal property: recapture min(gain, accum) as ordinary income, rest is §1231.
+  // §1250 real property (post-1986 SL): no "additional depreciation" → 0 ordinary, all §1231.
+  // 'none' (land): no recapture, full gain/loss is §1231.
+  // Loss case (proceeds ≤ basis): always §1231 loss, never §1245.
+  function recapture({ cost, accumulated, proceeds, propertyType }) {
+    const c = +cost || 0, a = +accumulated || 0, p = +proceeds || 0;
+    const basis = c - a;
+    const totalGL = p - basis;
+    if (totalGL <= 0) return { sec1245: 0, sec1231: r2(totalGL), totalGL: r2(totalGL), basis: r2(basis) };
+    if (propertyType === "1245") {
+      const recap = Math.min(totalGL, a);
+      return { sec1245: r2(recap), sec1231: r2(totalGL - recap), totalGL: r2(totalGL), basis: r2(basis) };
+    }
+    // 1250 or 'none' or anything else: 0 ordinary, full §1231
+    return { sec1245: 0, sec1231: r2(totalGL), totalGL: r2(totalGL), basis: r2(basis) };
+  }
+
+  // ---- Form 4562 helper: bucket a recovery period (life in years) into a class life ----
+  // Returns one of "3","5","7","10","15","20","25","27.5","39","Other".
+  function classLifeBucket(life) {
+    const L = +life || 0;
+    const lives = [3, 5, 7, 10, 15, 20, 25, 27.5, 39];
+    for (const cl of lives) if (Math.abs(L - cl) < 0.01) return String(cl);
+    return "Other";
+  }
+
+  global.Depreciation = { schedule, yearTotals, firstYearFraction, disposalYearFraction, recapture, classLifeBucket };
+})(typeof window !== 'undefined' ? window : (typeof globalThis !== 'undefined' ? globalThis : this));
 </script>
 
 <!-- ========== APP LOGIC ========== -->
@@ -541,6 +568,74 @@ async function refreshAll() {
     const probe = await sb.from("categories").select("property_type").limit(1);
     STATE.taxColsReady = !probe.error;
   } catch (_) { STATE.taxColsReady = false; }
+
+  // Schema guard: detect "unknown column" bugs proactively at startup. Surfaces
+  // the kind of error that took disposals down (assets.disposal_date didn't
+  // exist) before it bites a user mid-action.
+  STATE.schemaIssues = await runSchemaGuard();
+}
+
+// Columns this app writes to per table. If anything in here is missing from
+// the database schema, surface it loudly. Migration-gated columns are flagged
+// so we can omit them when the corresponding migration hasn't been run.
+const SCHEMA_EXPECT = {
+  assets: [
+    'id','description','asset_number','category_id','entity_id','in_service_date',
+    'cost','salvage_value','section_179','method','life_years','convention','bonus_pct',
+    'location','vendor','serial_number','vin','invoice_number','make','model','year',
+    'notes','status','pool_type','property_group','is_land','is_inventory','ownership_pct',
+    'co_owners','foaling_year','color','sex','sire','dam','bucket_tag',
+    'prior_accum_dep','improvements_cost','land_value','photos',
+    'created_by','updated_at',
+    { col:'property_type', gatedBy:'taxColsReady' },
+  ],
+  disposals: [
+    'id','asset_id','disposal_date','disposal_type','proceeds','fmv','buyer','notes',
+    'is_partial','ownership_pct_sold','cost_retired','created_by',
+  ],
+  transfers: [
+    'id','asset_id','from_entity_id','to_entity_id','transfer_date','reason','created_by',
+  ],
+  categories: [
+    'id','name','default_method','default_life_years','default_convention','color','sort_order',
+    { col:'property_type', gatedBy:'taxColsReady' },
+  ],
+  entities: [
+    'id','name','parent_group','entity_type','ownership_pct','notes',
+  ],
+  activity_log: [
+    'id','ts','user_email','entity_type','entity_id','action','summary','payload',
+  ],
+  allowed_emails: [
+    'id','email','role','note',
+  ],
+};
+
+async function runSchemaGuard() {
+  const issues = []; // [{table, missing:[col]}]
+  for (const [table, cols] of Object.entries(SCHEMA_EXPECT)) {
+    const expected = cols
+      .map(c => typeof c === 'string' ? { col:c } : c)
+      .filter(c => !c.gatedBy || STATE[c.gatedBy]);
+    const colList = expected.map(c => c.col).join(',');
+    const { error } = await sb.from(table).select(colList).limit(0);
+    if (!error) continue;
+    // Probe each column individually to identify which is missing
+    const missing = [];
+    for (const c of expected) {
+      const { error: e2 } = await sb.from(table).select(c.col).limit(0);
+      if (e2) missing.push(c.col);
+    }
+    if (missing.length) {
+      issues.push({ table, missing });
+      console.error('[SCHEMA GUARD] '+table+' is missing columns: '+missing.join(', '));
+    }
+  }
+  if (issues.length) {
+    const summary = issues.map(i => i.table+' ['+i.missing.join(', ')+']').join('; ');
+    console.error('[SCHEMA GUARD] Issues detected: '+summary);
+  }
+  return issues;
 }
 
 async function upsert(table, record) {
@@ -2043,6 +2138,7 @@ VIEWS.reports = function(root) {
   }
 
   root.appendChild(el("h2",{},"Reports"));
+  if (STATE.schemaIssues && STATE.schemaIssues.length) root.appendChild(schemaGuardBanner(STATE.schemaIssues));
   if (!STATE.taxColsReady) root.appendChild(migrationBanner());
 
   // Period fields (toggled by dateMode)
@@ -2500,6 +2596,24 @@ function renderDisposalReport(opts, setCsv) {
 }
 
 // ---------- Migration banner (shown in Reports if §1245/§1250 column missing) ----------
+// Banner shown when the schema guard detects missing columns. Surfaces the
+// kind of "could not find column X in schema cache" bug that would otherwise
+// only appear when a user clicks save.
+function schemaGuardBanner(issues) {
+  const lines = issues.map(i =>
+    el("div",{style:"font-family:ui-monospace,Menlo,monospace;font-size:11px;margin-top:2px"},
+      "• "+i.table+" — missing: "+i.missing.join(", ")));
+  return el("div",{class:"card",style:"border-left:4px solid var(--err);margin-bottom:14px;background:#fff5f0"},
+    el("div",{class:"bd"},
+      el("h3",{style:"margin:0 0 4px;color:var(--err)"}, "⚠ Schema mismatch detected"),
+      el("p",{class:"small",style:"margin:0 0 8px"},
+        "The app expects columns that aren't in the database. Operations that touch these tables may fail at save time."),
+      ...lines,
+      el("p",{class:"small",style:"margin-top:8px;color:var(--muted)"},
+        "Open browser console for full details. Resolve by running the relevant migration in Supabase Studio.")
+    ));
+}
+
 function migrationBanner() {
   const sql = el("textarea",{readonly:true,style:"width:100%;height:120px;font-family:ui-monospace,Menlo,monospace;font-size:11px;background:#fff;border:1px solid var(--border);border-radius:4px;padding:8px;margin-top:6px"}, MIGRATION_SQL_4797);
   return el("div",{class:"card",style:"border-left:4px solid #c98a2b;margin-bottom:14px"},
@@ -2547,16 +2661,8 @@ function renderForm4797(year, setCsv) {
     const gl = proceeds - basis;
 
     const ptype = effectivePropertyType(a);
-    let sec1245 = 0, sec1231 = 0;
-    if (gl <= 0) {
-      sec1231 = gl;
-    } else if (ptype === "1245") {
-      sec1245 = Math.min(gl, accum);
-      sec1231 = gl - sec1245;
-    } else {
-      // 1250 (post-1986 SL ⇒ 0 ordinary) or none
-      sec1231 = gl;
-    }
+    const rec = Depreciation.recapture({ cost: totalCost, accumulated: accum, proceeds, propertyType: ptype });
+    const sec1245 = rec.sec1245, sec1231 = rec.sec1231;
 
     const e = byId(STATE.entities, a.entity_id);
     const row = {
@@ -2639,12 +2745,7 @@ function renderForm4797(year, setCsv) {
 // year assets (line 17). Plus a per-entity rollup. Plus grand totals (§179,
 // bonus, regular MACRS, total). Trading inventory and land are excluded.
 function renderForm4562(year, setCsv) {
-  const CLASS_LIVES = [3, 5, 7, 10, 15, 20, 25, 27.5, 39];
-  const lifeBucket = (life) => {
-    const L = +life || 0;
-    for (const cl of CLASS_LIVES) if (Math.abs(L - cl) < 0.01) return String(cl);
-    return "Other";
-  };
+  const lifeBucket = Depreciation.classLifeBucket;
   const yearOfStr = s => s ? new Date(s).getUTCFullYear() : 0;
 
   // Excludes inventory + land — neither is depreciated
@@ -2674,7 +2775,7 @@ function renderForm4562(year, setCsv) {
 
   // ---- Section 1: current-year acquisitions, by class life ----
   const buckets = {};
-  CLASS_LIVES.forEach(cl => buckets[String(cl)] = { count:0, cost:0, sec179:0, bonus:0, reg:0, total:0 });
+  ['3','5','7','10','15','20','25','27.5','39'].forEach(cl => buckets[cl] = { count:0, cost:0, sec179:0, bonus:0, reg:0, total:0 });
   buckets["Other"] = { count:0, cost:0, sec179:0, bonus:0, reg:0, total:0 };
   current.forEach(x => {
     const k = lifeBucket(x.a.life_years);
