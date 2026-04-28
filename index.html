@@ -1534,7 +1534,9 @@ function openDisposalModal(assetId) {
           "Partial sale: "+rec.ownership_pct_sold+"% at "+fmt$(rec.proceeds||0)+" on "+rec.disposal_date+". Cost reduced to "+fmt$(newCost)+", Solo ownership now "+newOwn+"%.",
           { disposal_id: saved.id });
       } else {
-        await updateRec("assets", a.id, { status: "disposed", disposal_date: rec.disposal_date, updated_at: new Date().toISOString() });
+        // disposal_date lives on the disposals table; only flip status here.
+        // (Postgres rejects unknown columns; would surface as schema-cache error.)
+        await updateRec("assets", a.id, { status: "disposed", updated_at: new Date().toISOString() });
         const summary = "Disposed ("+rec.disposal_type+"): "+
           (rec.disposal_type==="donated" ? "FMV "+fmt$(rec.fmv||0) : "proceeds "+fmt$(rec.proceeds||0)) +
           " on "+rec.disposal_date;
@@ -1885,7 +1887,8 @@ async function unwindDisposal(dispId) {
           const restoredOwn  = r2((+a.ownership_pct||0) + (+d.ownership_pct_sold||0));
           await updateRec("assets", a.id, { cost: restoredCost, ownership_pct: restoredOwn, updated_at: new Date().toISOString() });
         } else {
-          await updateRec("assets", a.id, { status:"active", disposal_date: null, updated_at:new Date().toISOString() });
+          // disposal_date isn't a column on assets; just flip the status back.
+          await updateRec("assets", a.id, { status:"active", updated_at:new Date().toISOString() });
         }
       }
       await logActivity("asset", a?a.id:null, "unwind_dispose",
